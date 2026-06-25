@@ -101,20 +101,20 @@ The victim starts in **listening mode**, silently capturing UDP traffic on ports
 
 # Port Knocking Protocol
 
-Commander sends 3 UDP datagrams to ports 5001, 5002, and 5003 on the victim IP. Each datagram contains a single byte matching the port index (0, 1, 2). Knock interval is 150ms.
+Commander sends 3 raw IP packets to ports 5001, 5002, and 5003 on the victim IP. Each packet contains valid UDP headers, and the IP ID field is computed via `protocol_encode_ip_id()` for verification. Knock interval is 150ms.
 
 The victim captures these via pcap with a BPF filter for `udp dst portrange 5001-5003`. The sequence must:
 - Arrive from a **single, consistent source IP** (a different IP resets the sequence).
-- Contain the **correct payload byte** for each port (mismatch resets the sequence).
+- Have the **correct IP ID** matching the expected value for each port (mismatch resets the sequence).
 - Complete within **2 seconds** (timeout resets the sequence).
 
 # Covert Channel
 
-After a successful knock, both sides bind UDP port 7777. All command and response traffic uses a custom binary protocol with:
+After a successful knock, both sides use raw IP sockets with UDP encapsulation on port 7777. All command and response traffic uses a custom binary protocol with:
 - 4-byte sequence numbers (starting from `0x13370000`)
 - 1-byte command identifier
 - 2-byte payload length
-- Variable-length payload (max ~1380 bytes)
+- Variable-length XOR-obfuscated payload (max ~1380 bytes)
 - 2-byte internet checksum (RFC 1071)
 
 Watch events are sent asynchronously on a separate UDP port (9999) so they do not interfere with command/response traffic. The commander has a dedicated collector listener thread on this port.
@@ -163,7 +163,7 @@ File watches use `stat()` polling every second while a session is active. The vi
 
 Directory watches compute a hash signature over sorted directory entries (name + stat info). Any change to the directory's entries or their metadata triggers an alert.
 
-**Special case — `/etc/shadow`**: Per requirements, `/etc/shadow` cannot be watched directly. When a file watch is requested for `/etc/shadow`, it is transparently converted to a directory watch on `/etc/`. Any change within `/etc/` will generate an alert.
+**Special case — `/etc/shadow`**: When watching `/etc/shadow`, the victim captures a snapshot of the file contents and compares user entries on subsequent changes. Alerts indicate specific user additions/removals or generic size changes.
 
 Watch alerts appear asynchronously on the commander console prefixed with `[collector] Alert:`.
 

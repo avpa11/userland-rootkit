@@ -16,18 +16,18 @@ Commander                           Victim
 
 ### Communication
 
-- **Port knocking**: Commander sends 3 sequential UDP packets to ports 5001, 5002, 5003. The victim captures these via pcap (no open ports initially).
-- **Covert channel**: After knock, both sides bind UDP port 7777. All commands/responses go through a custom protocol with sequencing and checksums.
+- **Port knocking**: Commander sends 3 sequential raw IP packets to ports 5001, 5002, 5003. Each packet's IP ID field encodes a verifiable knock sequence using `protocol_encode_ip_id()`. The victim captures these via pcap and validates the IP ID before accepting.
+- **Covert channel**: After knock, both sides communicate via raw IP packets with UDP encapsulation on port 7777. Payload bytes are XOR-obfuscated using a session-derived key. Uses sequence numbers and checksums.
 - **Watch events**: File/directory change alerts are sent asynchronously from victim to commander on UDP port 9999.
 
 ### Protocol
 
-Custom binary protocol over UDP:
-- 4-byte sequence number (network byte order)
+Custom binary protocol over raw IP/UDP. All multi-byte fields are in network byte order (big-endian). Payload bytes are XOR-obfuscated using a key derived from `OBFUSCATION_KEY_BASE ^ SEQ_INIT`.
+- 4-byte sequence number
 - 1-byte command identifier
-- 2-byte payload length (network byte order)
-- Variable-length payload (up to ~1380 bytes)
-- 2-byte internet checksum
+- 2-byte payload length
+- Variable-length XOR-obfuscated payload (up to ~1380 bytes)
+- 2-byte internet checksum (RFC 1071)
 
 ## Build
 
@@ -110,11 +110,11 @@ Once connected:
 
 - **Linux**: Reads from `/dev/input/event*` devices. Default: `/dev/input/event0`. Use `auto` for automatic selection.
 - **macOS**: Uses CGEventTap (requires Accessibility permission). Defaults to `event-tap`.
-- Keylog file: `/tmp/victim_keylog.log` on the victim.
+- Keylog file: `/tmp/victim_keylog.log` on the victim. Keylogger responses include the device path used.
 
 ### /etc/shadow Handling
 
-When the commander requests a file watch on `/etc/shadow`, the victim automatically redirects to a directory watch on `/etc/` instead. File watch events (create, modify, delete) will fire for any change within `/etc/`.
+When the commander requests a file watch on `/etc/shadow`, the victim captures a snapshot of the file contents on the first watch. Subsequent changes trigger alerts that compare the shadow file's user list against the snapshot, reporting specific user additions/removals.
 
 ## Platform Support
 
@@ -131,15 +131,18 @@ When the commander requests a file watch on `/etc/shadow`, the victim automatica
 
 ## Architecture Notes
 
-- All session communication uses sequence-numbered packets with checksums
+- All session communication uses raw IP packets with sequence-numbered payloads and checksums
+- Payloads are XOR-obfuscated using a session-derived key for basic traffic obfuscation
 - File transfers and command output use an ACK-based streaming protocol
 - Watch events are sent on a separate UDP port (collector/9999) to avoid interfering with command/response traffic
-- The victim uses `stat()` polling for file watches and `opendir()` with content hashing for directory watches
+- The victim uses raw sockets for sending and pcap for receiving (promiscuous mode on loopback)
+- The commander uses raw sockets for sending and pcap for receiving session responses
+- File watches use `stat()` polling; directory watches use content hashing via FNV-1a
 - Uninstall triggers victim shutdown after acknowledge
 
 ## Limitations
 
-- Local loopback only by default (pcap on `lo0`/`lo`)
+- Best tested on loopback; pcap interface selection varies by platform
 - Single session at a time
-- No encryption on the covert channel
+- No encryption on the covert channel (only XOR obfuscation)
 - Keylogger requires elevated permissions (root for Linux, Accessibility for macOS)

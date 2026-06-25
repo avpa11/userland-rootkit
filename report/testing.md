@@ -55,7 +55,7 @@
 | File download (Victim→Commander) | File fetched from victim, stored locally | File verified | File verified | [Test 12](#test-12) |
 | File watch | Changes to watched file trigger alert | Alert received | Alert received | [Test 13](#test-13) |
 | Directory watch | Changes to watched directory trigger alert | Alert received | Alert received | [Test 14](#test-14) |
-| /etc/shadow redirect | Shadow watch converts to /etc/ directory watch | Redirected | Redirected | [Test 15](#test-15) |
+| /etc/shadow watch | Shadow file watched with snapshot-based change detection | Detected | Detected | [Test 15](#test-15) |
 | Disconnect | Session closes cleanly, commander returns to disconnected menu | Disconnected | Disconnected | [Test 16](#test-16) |
 | Uninstall | Victim acknowledges, exits cleanly, commander exits | Both exit | Both exit | [Test 17](#test-17) |
 
@@ -165,10 +165,11 @@ Non-numeric input produces an error and re-displays the menu. Out-of-range numbe
 **Victim console:**
 ```
 Victim agent started (pcap-based knock detection)
-Accepted knock 1/3 from 127.0.0.1
-Accepted knock 2/3 from 127.0.0.1
-Accepted knock 3/3 from 127.0.0.1
-Session opened for 127.0.0.1 on UDP port 7777
+DEBUG: pcap opened, DLT=X
+Accepted knock 1/3 from 127.0.0.1 (verified IP ID 0xXXXX)
+Accepted knock 2/3 from 127.0.0.1 (verified IP ID 0xXXXX)
+Accepted knock 3/3 from 127.0.0.1 (verified IP ID 0xXXXX)
+Session opened for 127.0.0.1 on UDP port 7777 (pcap-based)
 ```
 
 **Commander console:**
@@ -301,15 +302,15 @@ Directory changes are detected via content-hash comparison. The FNV-1a-based sig
 
 ## Test 15 {#test-15}
 
-*/etc/shadow redirect*
+*/etc/shadow snapshot*
 
 ```
 > 6
 Remote file path to watch: /etc/shadow
-Victim OK: watching directory /etc/
+Victim OK: watching file /etc/shadow
 ```
 
-Because `/etc/shadow` is flagged by `path_is_shadow()` on the victim, the file watch is transparently converted to a directory watch on `/etc/`. Any change within `/etc/` triggers an alert.
+The victim captures a snapshot of `/etc/shadow` contents. On subsequent changes, the victim compares user entries and reports specific additions/removals (e.g., "changed - new user alice, removed user bob") or falls back to size-based change notification.
 
 ## Test 16 {#test-16}
 
