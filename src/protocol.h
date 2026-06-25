@@ -44,6 +44,8 @@
 
 #define PROTOCOL_PACKET_PAYLOAD_MAX (PACKET_SIZE_MAX - sizeof(covert_header_t) - CHECKSUM_SIZE)
 
+#define OBFUSCATION_KEY_BASE 0xC75A9E3Du
+
 #if defined(__GNUC__) || defined(__clang__)
 #define PROTOCOL_PACKED __attribute__((packed))
 #else
@@ -71,6 +73,8 @@ typedef struct {
 } network_message_t;
 
 uint16_t protocol_compute_checksum(const uint8_t *data, size_t len);
+uint32_t protocol_derive_obfuscation_key(uint32_t session_id);
+void protocol_obfuscate_payload(uint8_t *data, size_t len, uint32_t key);
 int protocol_parse_packet(const uint8_t *packet, size_t packet_len, parsed_packet_t *parsed, char *error, size_t error_len);
 size_t protocol_build_packet(
     uint32_t seq_num,
@@ -83,5 +87,7 @@ size_t protocol_build_packet(
     size_t error_len
 );
 const char *protocol_command_name(uint8_t command);
+uint32_t protocol_knock_session_token(uint32_t session_id);
+uint16_t protocol_encode_ip_id(uint8_t knock_index, uint32_t token);
 
 #endif
