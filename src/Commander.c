@@ -2,6 +2,7 @@
 #include <errno.h>
 #include "keylogger.h"
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include "protocol.h"
 #include <stdio.h>
@@ -21,6 +22,14 @@
 #define EXEC_RESPONSE_TIMEOUT_MS 30000
 #define MENU_INVALID -1
 #define MENU_EOF     -2
+
+static char *format_safe(char *dst, size_t dstlen, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    (void)vsnprintf(dst, dstlen, fmt, ap);
+    va_end(ap);
+    return dst;
+}
 
 typedef struct {
     int sock;
@@ -221,7 +230,7 @@ static int set_victim_ip(commander_config_t *cfg) {
         return -1;
     }
 
-    snprintf(cfg->victim_ip, sizeof(cfg->victim_ip), "%s", ip);
+    format_safe(cfg->victim_ip, sizeof(cfg->victim_ip), "%s", ip);
     return 0;
 }
 

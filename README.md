@@ -41,6 +41,12 @@ Custom binary protocol over UDP:
 
 ### Compile
 
+#### For Linux
+
+```bash
+sudo apt-get install -y libpcap-dev 2>&1
+```
+
 ```bash
 make
 ```
