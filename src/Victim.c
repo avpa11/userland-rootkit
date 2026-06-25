@@ -200,7 +200,7 @@ static int open_pcap(victim_state_t *state) {
     );
     if (state->pcap_handle == NULL) {
         state->pcap_handle = pcap_open_live(
-            "lo0",
+            "ens3",
             PCAP_SNAPLEN,
             1,
             PCAP_TIMEOUT_MS,
@@ -232,6 +232,9 @@ static int open_pcap(victim_state_t *state) {
     if (state->pcap_handle == NULL) {
         return -1;
     }
+
+    fprintf(stderr, "DEBUG: pcap opened, DLT=%d\n", pcap_datalink(state->pcap_handle));
+    fflush(stderr);
 
     snprintf(filter_expr, sizeof(filter_expr),
              "udp dst portrange %u-%u",
@@ -497,6 +500,8 @@ static void pcap_knock_handler(u_char *args, const struct pcap_pkthdr *header, c
     (void)header;
 
     datalink = pcap_datalink(state->pcap_handle);
+    fprintf(stderr, "DEBUG knock: DL=%d caplen=%u\n", datalink, (unsigned)header->caplen);
+    fflush(stderr);
 
     if (datalink == DLT_LINUX_SLL) {
         uint16_t proto;
@@ -505,6 +510,13 @@ static void pcap_knock_handler(u_char *args, const struct pcap_pkthdr *header, c
             return;
         }
         ip_hdr = packet + 16;
+    } else if (datalink == DLT_LINUX_SLL2) {
+        uint16_t proto;
+        memcpy(&proto, packet + 18, 2);
+        if (ntohs(proto) != 0x0800) {
+            return;
+        }
+        ip_hdr = packet + 20;
     } else if (datalink == DLT_NULL) {
         uint32_t family;
         memcpy(&family, packet, 4);
@@ -769,6 +781,10 @@ static void pcap_session_handler(u_char *args, const struct pcap_pkthdr *header,
         uint16_t proto; memcpy(&proto, packet + 14, 2);
         if (ntohs(proto) != 0x0800) return;
         ip_hdr = packet + 16;
+    } else if (datalink == DLT_LINUX_SLL2) {
+        uint16_t proto; memcpy(&proto, packet + 18, 2);
+        if (ntohs(proto) != 0x0800) return;
+        ip_hdr = packet + 20;
     } else if (datalink == DLT_NULL) {
         uint32_t family; memcpy(&family, packet, 4);
         if (family != 2) return;
