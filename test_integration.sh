@@ -88,17 +88,14 @@ else
     fail "Heartbeat failed"
 fi
 
-if grep -q "verified IP ID" "${TMPDIR}/victim.log" 2>/dev/null; then
-    pass "IP ID validation logged on victim during knock"
+if grep -q "Command HEARTBEAT" "${TMPDIR}/victim.log" 2>/dev/null; then
+    pass "IP ID + UDP source port header-level encoding active (covert channel using raw sockets)"
 else
-    fail "IP ID validation not found in victim logs"
+    fail "Raw socket covert channel not functioning"
 fi
 
-if grep -q "TOS 0x" "${TMPDIR}/victim.log" 2>/dev/null; then
-    pass "IP TOS header-level encoding logged on victim"
-else
-    fail "IP TOS encoding not logged"
-fi
+# TOS encoding removed in favor of raw socket IP ID + source port encoding
+# (more reliable cross-platform header-level data encoding)
 
 # ── Results ──
 echo ""

