@@ -75,9 +75,12 @@ const char *keylogger_platform_default_device(void) {
 }
 
 #ifdef __linux__
+#define KEYLOG_NBITS(x) (((x) + 8 * sizeof(unsigned long) - 1) / (8 * sizeof(unsigned long)))
+#define KEYLOG_BIT_TEST(arr, bit) (((arr)[(bit) / (8 * sizeof(unsigned long))] >> ((bit) % (8 * sizeof(unsigned long)))) & 1UL)
+
 static int linux_is_keyboard_device(const char *device_path) {
-    unsigned long evbit[BITS_TO_LONGS(EV_CNT)];
-    unsigned long keybit[BITS_TO_LONGS(KEY_CNT)];
+    unsigned long evbit[KEYLOG_NBITS(EV_CNT)];
+    unsigned long keybit[KEYLOG_NBITS(KEY_CNT)];
     int fd;
     int ret = 0;
 
@@ -104,12 +107,12 @@ static int linux_is_keyboard_device(const char *device_path) {
         return 0;
     }
 
-    if (keybit[BTN_LEFT / BITS_PER_LONG] & (1UL << (BTN_LEFT % BITS_PER_LONG))) {
+    if (KEYLOG_BIT_TEST(keybit, BTN_LEFT)) {
         close(fd);
         return 0;
     }
 
-    if (keybit[KEY_A / BITS_PER_LONG] & (1UL << (KEY_A % BITS_PER_LONG))) {
+    if (KEYLOG_BIT_TEST(keybit, KEY_A)) {
         ret = 1;
     }
 
